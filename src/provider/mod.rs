@@ -20,6 +20,7 @@ mod route_builders;
 mod routing;
 mod selection;
 mod startup;
+pub mod subagent_rate_limiter;
 
 use crate::auth;
 use crate::message::{Message, ToolDefinition};

@@ -131,6 +131,11 @@ impl UsageOverlay {
             }
         }
 
+        if !refreshing {
+            let cost_item = build_cost_summary_item();
+            items.insert(0, cost_item);
+        }
+
         let title = if refreshing {
             " Usage · refreshing "
         } else {
@@ -718,4 +723,64 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup[1])[1]
+}
+
+fn build_cost_summary_item() -> UsageOverlayItem {
+    let today = crate::cost_ledger::today_cost();
+    let week = crate::cost_ledger::week_cost();
+    let month = crate::cost_ledger::month_cost();
+
+    let session_id = crate::get_current_session().unwrap_or_default();
+    let session_summary = crate::cost_ledger::query_summary(None, if session_id.is_empty() { None } else { Some(&session_id) });
+
+    let mut detail = Vec::new();
+    detail.push("## Cost Summary (jcode-lk)".to_string());
+    detail.push("".to_string());
+    detail.push(format!("• Today:      ${:.4}", today));
+    detail.push(format!("• This week:  ${:.4}", week));
+    detail.push(format!("• This month: ${:.4}", month));
+
+    if !session_id.is_empty() && session_summary.total_usd > 0.0 {
+        detail.push("".to_string());
+        detail.push(format!("## This session: ${:.4}", session_summary.total_usd));
+        let mut tok_in: u64 = 0;
+        let mut tok_out: u64 = 0;
+        for s in &session_summary.by_session {
+            tok_in += s.input_tokens;
+            tok_out += s.output_tokens;
+        }
+        detail.push(format!("• Input:  {} tokens", tok_in));
+        detail.push(format!("• Output: {} tokens", tok_out));
+    }
+
+    let daily_summary = crate::cost_ledger::query_summary(
+        Some(chrono::Utc::now() - chrono::Duration::hours(24)),
+        None,
+    );
+    if !daily_summary.by_provider.is_empty() {
+        detail.push("".to_string());
+        detail.push("## Today by provider".to_string());
+        for p in &daily_summary.by_provider {
+            if p.cost_usd > 0.0 {
+                detail.push(format!("• {}: ${:.4}", p.provider, p.cost_usd));
+            }
+        }
+    }
+
+    let subtitle = format!(
+        "Today: ${:.4} | Week: ${:.4} | Month: ${:.4}",
+        today, week, month
+    );
+
+    UsageOverlayItem::new(
+        "cost-summary",
+        "Cost Summary",
+        subtitle,
+        if today > 1.0 {
+            UsageOverlayStatus::Warning
+        } else {
+            UsageOverlayStatus::Good
+        },
+        detail,
+    )
 }

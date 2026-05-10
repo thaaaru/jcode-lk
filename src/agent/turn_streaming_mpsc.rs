@@ -527,6 +527,25 @@ impl Agent {
                     usage_cache_read,
                     usage_cache_creation,
                 );
+                crate::cost_ledger::record(
+                    &self.session.id,
+                    self.session.parent_id.as_deref(),
+                    if self.session.parent_id.is_some() { "subagent" } else { "main" },
+                    self.provider.name(),
+                    &self.provider.model(),
+                    usage_input.unwrap_or(0),
+                    usage_output.unwrap_or(0),
+                    usage_cache_read.unwrap_or(0),
+                    usage_cache_creation.unwrap_or(0),
+                    crate::cost_ledger::compute_cost(
+                        self.provider.name(),
+                        &self.provider.model(),
+                        usage_input.unwrap_or(0),
+                        usage_output.unwrap_or(0),
+                        usage_cache_read.unwrap_or(0),
+                        usage_cache_creation.unwrap_or(0),
+                    ),
+                );
             }
 
             if usage_input.is_some()

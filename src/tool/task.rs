@@ -204,8 +204,18 @@ impl Tool for SubagentTool {
 
         // Run subagent on an isolated provider fork so model/session changes do not
         // mutate the coordinator's provider instance.
+        // Wrap with rate-limited provider for sub-agent token budget control.
+        let forked_provider = self.provider.fork();
+        let cfg = crate::config::config();
+        let has_budget = cfg.agents.subagent_rolling_token_budget.is_some()
+            || cfg.agents.subagent_tokens_per_minute.is_some();
+        let provider: Arc<dyn crate::provider::Provider> = if has_budget {
+            crate::provider::subagent_rate_limiter::SubagentRateLimitedProvider::wrap(forked_provider)
+        } else {
+            forked_provider
+        };
         let mut agent = Agent::new_with_session(
-            self.provider.fork(),
+            provider,
             self.registry.clone(),
             session,
             Some(allowed),

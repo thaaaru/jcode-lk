@@ -361,6 +361,14 @@ pub struct AgentsConfig {
     pub memory_model: Option<String>,
     /// Whether memory should use the sidecar for relevance/extraction.
     pub memory_sidecar_enabled: bool,
+    /// Sub-agent rolling token budget (total tokens allowed per window).
+    pub subagent_rolling_token_budget: Option<u64>,
+    /// Sub-agent rolling budget window duration (e.g. "4h", "24h").
+    pub subagent_rolling_token_window: Option<String>,
+    /// Sub-agent tokens-per-minute burst limit.
+    pub subagent_tokens_per_minute: Option<u64>,
+    /// What to do when sub-agent budget is exceeded: "wait", "reject", or "degrade".
+    pub subagent_budget_exceeded: Option<String>,
 }
 
 /// Automatic end-of-turn code review configuration.
