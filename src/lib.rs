@@ -19,6 +19,7 @@ pub mod cache_tracker;
 pub mod catchup;
 pub mod channel;
 pub mod cli;
+pub mod cognitive;
 pub mod cost_ledger;
 pub mod compaction;
 pub mod config;
