@@ -146,7 +146,7 @@ pub const OPENCODE_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     api_key_env: "OPENCODE_API_KEY",
     env_file: "opencode.env",
     setup_url: "https://opencode.ai/docs/providers#opencode-zen",
-    default_model: Some("qwen/qwen3-coder-plus"),
+    default_model: Some("minimax-m2.7"),
     requires_api_key: true,
 };
 
@@ -157,7 +157,7 @@ pub const OPENCODE_GO_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile
     api_key_env: "OPENCODE_GO_API_KEY",
     env_file: "opencode-go.env",
     setup_url: "https://opencode.ai/docs/providers#opencode-go",
-    default_model: Some("THUDM/GLM-4.5"),
+    default_model: Some("kimi-k2.5"),
     requires_api_key: true,
 };
 
@@ -420,7 +420,7 @@ pub const OLLAMA_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     api_base: "http://localhost:11434/v1",
     api_key_env: "OLLAMA_API_KEY",
     env_file: "ollama.env",
-    setup_url: "https://ollama.com/blog/openai-compatibility",
+    setup_url: "https://docs.ollama.com/api/openai-compatibility",
     default_model: None,
     requires_api_key: false,
 };
@@ -432,7 +432,11 @@ pub const CHUTES_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     api_key_env: "CHUTES_API_KEY",
     env_file: "chutes.env",
     setup_url: "https://chutes.ai",
-    default_model: Some("Qwen/Qwen3-Coder-480B-A35B-Instruct"),
+    // Chutes' accessible models change with capacity/key access. Do not keep a
+    // static default here: post-login activation should select from the live
+    // `/models` catalog instead of advertising a stale model that may 404 at
+    // chat/completions time.
+    default_model: None,
     requires_api_key: true,
 };
 
@@ -443,7 +447,7 @@ pub const CEREBRAS_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     api_key_env: "CEREBRAS_API_KEY",
     env_file: "cerebras.env",
     setup_url: "https://inference-docs.cerebras.ai/introduction",
-    default_model: Some("qwen-3-coder-480b"),
+    default_model: Some("qwen-3-235b-a22b-instruct-2507"),
     requires_api_key: true,
 };
 
@@ -608,7 +612,7 @@ pub const AZURE_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescripto
     menu_detail: "Microsoft Entra ID or Azure OpenAI API key",
     recommended: false,
     target: LoginProviderTarget::Azure,
-    order: LoginProviderSurfaceOrder::new(Some(5), None, None, None, Some(4)),
+    order: LoginProviderSurfaceOrder::new(Some(5), Some(5), None, None, Some(4)),
 };
 
 pub const OPENCODE_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
@@ -1226,14 +1230,21 @@ fn allows_insecure_http_host(host: &str) -> bool {
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(host);
-    if host.eq_ignore_ascii_case("localhost") {
+    let host_lower = host.to_ascii_lowercase();
+    if host_lower == "localhost" || host_lower.ends_with(".local") {
         return true;
     }
 
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return match ip {
             std::net::IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+                let raw = u32::from(v4);
+                let is_carrier_grade_nat = (raw & 0xffc0_0000) == 0x6440_0000;
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || is_carrier_grade_nat
             }
             std::net::IpAddr::V6(v6) => {
                 v6.is_loopback()
@@ -1289,6 +1300,14 @@ mod tests {
             Some("http://10.0.0.8:11434/v1")
         );
         assert_eq!(
+            normalize_api_base("http://100.103.78.84:11434/v1").as_deref(),
+            Some("http://100.103.78.84:11434/v1")
+        );
+        assert_eq!(
+            normalize_api_base("http://hsv.local:11434/v1").as_deref(),
+            Some("http://hsv.local:11434/v1")
+        );
+        assert_eq!(
             normalize_api_base("http://[fd00::1]:8080/v1").as_deref(),
             Some("http://[fd00::1]:8080/v1")
         );
@@ -1312,6 +1331,27 @@ mod tests {
     fn minimax_profile_uses_official_openai_compatible_configuration() {
         assert_eq!(MINIMAX_PROFILE.api_base, "https://api.minimax.io/v1");
         assert_eq!(MINIMAX_PROFILE.api_key_env, "OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn ollama_profile_is_local_openai_compatible_without_required_api_key() {
+        assert_eq!(OLLAMA_PROFILE.id, "ollama");
+        assert_eq!(OLLAMA_PROFILE.api_base, "http://localhost:11434/v1");
+        assert_eq!(OLLAMA_PROFILE.api_key_env, "OLLAMA_API_KEY");
+        assert_eq!(OLLAMA_PROFILE.env_file, "ollama.env");
+        assert_eq!(
+            OLLAMA_PROFILE.setup_url,
+            "https://docs.ollama.com/api/openai-compatibility"
+        );
+        assert_eq!(OLLAMA_PROFILE.default_model, None);
+        assert!(!OLLAMA_PROFILE.requires_api_key);
+
+        assert_eq!(OLLAMA_LOGIN_PROVIDER.auth_kind, LoginProviderAuthKind::Local);
+        assert_eq!(OLLAMA_LOGIN_PROVIDER.auth_status_method, "local endpoint");
+        assert!(matches!(
+            OLLAMA_LOGIN_PROVIDER.target,
+            LoginProviderTarget::OpenAiCompatible(profile) if profile.id == "ollama"
+        ));
     }
 
     #[test]

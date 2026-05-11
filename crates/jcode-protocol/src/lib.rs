@@ -62,6 +62,97 @@ pub struct SessionActivitySnapshot {
     pub current_tool_name: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct AuthProviderId(pub String);
+
+impl AuthProviderId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct RuntimeProviderKey(pub String);
+
+impl RuntimeProviderKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct CatalogNamespace(pub String);
+
+impl CatalogNamespace {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthCredentialSource {
+    ApiKeyFile,
+    ProcessEnv,
+    OAuthTokenStore,
+    ExternalImport,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMethod {
+    TuiPasteApiKey,
+    RemoteTuiPasteApiKey,
+    CliLogin,
+    EnvFilePreseeded,
+    ProcessEnvPreseeded,
+    OAuthBrowser,
+    DeviceCode,
+    ExternalImport,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthChanged {
+    pub provider: AuthProviderId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<AuthCredentialSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<AuthMethod>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_runtime: Option<RuntimeProviderKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_catalog_namespace: Option<CatalogNamespace>,
+}
+
+impl AuthChanged {
+    pub fn new(provider: impl Into<String>) -> Self {
+        Self {
+            provider: AuthProviderId::new(provider),
+            credential_source: None,
+            auth_method: None,
+            expected_runtime: None,
+            expected_catalog_namespace: None,
+        }
+    }
+}
+
 pub type ReloadRecoverySnapshot = jcode_selfdev_types::ReloadRecoveryDirective;
 
 /// Client request to server
@@ -300,7 +391,19 @@ pub enum Request {
 
     /// Notify server that auth credentials changed (e.g., after login)
     #[serde(rename = "notify_auth_changed")]
-    NotifyAuthChanged { id: u64 },
+    NotifyAuthChanged {
+        id: u64,
+        /// Optional runtime provider identity whose credentials changed. Older
+        /// clients omit this and get the legacy generic refresh behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        /// Typed auth lifecycle event for new clients. The legacy `provider`
+        /// string is retained for old clients, while this payload gives the
+        /// server enough context to activate the intended runtime/catalog
+        /// profile deterministically.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<AuthChanged>,
+    },
 
     /// Switch active Anthropic account label on the server session.
     /// This keeps account overrides and provider credential caches in sync.
@@ -662,6 +765,31 @@ pub enum ServerEvent {
         cache_read_input: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_creation_input: Option<u64>,
+    },
+
+    /// Prompt-shape signature for the API request that will later report token
+    /// usage. Remote clients use this to diagnose KV-cache misses.
+    #[serde(rename = "kv_cache_request")]
+    KvCacheRequest {
+        system_static_hash: u64,
+        tools_hash: u64,
+        messages_hash: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        message_hashes: Vec<u64>,
+        message_count: usize,
+        tool_count: usize,
+        #[serde(default)]
+        system_static_chars: usize,
+        #[serde(default)]
+        tools_json_chars: usize,
+        #[serde(default)]
+        messages_json_chars: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ephemeral_hash: Option<u64>,
+        #[serde(default)]
+        ephemeral_chars: usize,
+        #[serde(default)]
+        ephemeral_message_count: usize,
     },
 
     /// Active transport/connection type for the current stream
@@ -1888,7 +2016,7 @@ impl Request {
             Request::Transfer { id } => *id,
             Request::Compact { id } => *id,
             Request::TriggerMemoryExtraction { id } => *id,
-            Request::NotifyAuthChanged { id } => *id,
+            Request::NotifyAuthChanged { id, .. } => *id,
             Request::SwitchAnthropicAccount { id, .. } => *id,
             Request::SwitchOpenAiAccount { id, .. } => *id,
             Request::StdinResponse { id, .. } => *id,

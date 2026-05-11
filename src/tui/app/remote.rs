@@ -131,6 +131,16 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
         if !app.is_processing
             && let Some(pending) = app.rate_limit_pending_message.clone()
         {
+            if matches!(app.status, ProcessingStatus::WaitingForNetwork { .. })
+                && !crate::network_retry::is_probably_online().await
+            {
+                app.schedule_pending_remote_network_wait("network probe still failing");
+                return true;
+            }
+            if matches!(app.status, ProcessingStatus::WaitingForNetwork { .. }) {
+                app.status = ProcessingStatus::Idle;
+                app.status_detail = None;
+            }
             let status = if pending.auto_retry {
                 format!(
                     "✓ Retrying continuation...{}",
@@ -242,7 +252,18 @@ pub(super) async fn handle_terminal_event(
             if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 handle_remote_key_event(app, key, remote).await?;
                 if let Some(spec) = app.pending_model_switch.take() {
-                    let _ = remote.set_model(&spec).await;
+                    match remote.set_model(&spec).await {
+                        Ok(_) => {
+                            app.remote_model_switch_in_flight = true;
+                        }
+                        Err(error) => {
+                            app.push_display_message(DisplayMessage::error(format!(
+                                "Failed to request model switch: {}",
+                                error
+                            )));
+                            app.set_status_notice("Model switch failed");
+                        }
+                    }
                 }
                 if let Some(selection) = app.pending_account_picker_action.take() {
                     match selection {
@@ -358,6 +379,9 @@ pub(super) async fn handle_bus_event(
         Ok(BusEvent::ModelRefreshCompleted(result)) => {
             app.handle_model_refresh_completed(result);
         }
+        Ok(BusEvent::UiActivity(activity)) => {
+            super::local::handle_ui_activity(app, activity);
+        }
         Ok(BusEvent::GitStatusCompleted(result)) => {
             super::commands::handle_git_status_completed(app, result);
         }
@@ -367,9 +391,11 @@ pub(super) async fn handle_bus_event(
         }
         Ok(BusEvent::LoginCompleted(login)) => {
             let success = login.success && login.provider != "copilot_code";
+            let provider_hint = auth_provider_hint_for_login_provider(&login.provider);
+            let auth = auth_changed_event_for_login_provider(&login.provider);
             app.handle_login_completed(login);
             if success {
-                remote.notify_auth_changed_detached();
+                remote.notify_auth_changed_detached_event(provider_hint, auth);
             }
         }
         Ok(BusEvent::UpdateStatus(status)) => {
@@ -404,6 +430,40 @@ pub(super) async fn handle_bus_event(
         }
         _ => {}
     }
+}
+
+fn auth_provider_hint_for_login_provider(provider: &str) -> Option<&'static str> {
+    let provider = provider.trim();
+    if provider.eq_ignore_ascii_case("azure")
+        || provider.eq_ignore_ascii_case("azure-openai")
+        || provider.eq_ignore_ascii_case("azure openai")
+    {
+        Some("azure-openai")
+    } else if let Some(profile) =
+        crate::provider_catalog::resolve_openai_compatible_profile_selection(provider)
+    {
+        Some(profile.id)
+    } else {
+        None
+    }
+}
+
+fn auth_changed_event_for_login_provider(provider: &str) -> Option<crate::protocol::AuthChanged> {
+    let provider_id = auth_provider_hint_for_login_provider(provider)?;
+    let mut auth = crate::protocol::AuthChanged::new(provider_id);
+    auth.auth_method = Some(crate::protocol::AuthMethod::RemoteTuiPasteApiKey);
+    auth.credential_source = Some(crate::protocol::AuthCredentialSource::ApiKeyFile);
+    if provider_id == "azure-openai" {
+        auth.expected_runtime = Some(crate::protocol::RuntimeProviderKey::new("azure-openai"));
+        auth.expected_catalog_namespace =
+            Some(crate::protocol::CatalogNamespace::new("azure-openai"));
+    } else if crate::provider_catalog::openai_compatible_profile_by_id(provider_id).is_some() {
+        auth.expected_runtime = Some(crate::protocol::RuntimeProviderKey::new(
+            "openai-compatible",
+        ));
+        auth.expected_catalog_namespace = Some(crate::protocol::CatalogNamespace::new(provider_id));
+    }
+    Some(auth)
 }
 
 pub(super) async fn check_debug_command(
@@ -596,6 +656,20 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
     let _ = recover_stranded_soft_interrupts(app, remote).await;
 
     if app.pending_queued_dispatch {
+        return;
+    }
+
+    if !app.remote_model_switch_in_flight
+        && !app.is_processing
+        && let Some(prepared) = app.pending_prompt_after_model_switch.take()
+    {
+        if let Err(error) = submit_prepared_remote_input(app, remote, prepared).await {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to submit prompt after model switch: {}",
+                error
+            )));
+            app.set_status_notice("Queued prompt failed");
+        }
         return;
     }
 
@@ -1066,7 +1140,7 @@ fn handle_disconnected_key_internal(
         return Ok(());
     }
 
-    if code == KeyCode::Enter && modifiers.contains(KeyModifiers::SHIFT) {
+    if code == KeyCode::Enter && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
         input::insert_input_text(app, "\n");
         return Ok(());
     }

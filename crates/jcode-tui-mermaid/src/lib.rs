@@ -22,11 +22,25 @@ mod svg;
 use base64::Engine as _;
 use image::DynamicImage;
 use image::GenericImageView;
+#[cfg(all(
+    feature = "renderer",
+    not(all(feature = "mmdr-size-api", mmdr_size_api_available))
+))]
+use mermaid_rs_renderer::render::render_svg;
+#[cfg(all(
+    feature = "renderer",
+    feature = "mmdr-size-api",
+    mmdr_size_api_available
+))]
+use mermaid_rs_renderer::render::{
+    measure_svg_dimensions as mmdr_measure_svg_dimensions,
+    render_svg_with_dimensions as mmdr_render_svg_with_dimensions,
+};
+#[cfg(feature = "renderer")]
 use mermaid_rs_renderer::{
     config::{LayoutConfig, RenderConfig},
-    layout::compute_layout,
+    layout::{Layout, compute_layout},
     parser::parse_mermaid,
-    render::render_svg,
     theme::Theme,
 };
 use ratatui::prelude::*;
@@ -37,6 +51,7 @@ use ratatui_image::{
     protocol::StatefulProtocol,
 };
 use serde::Serialize;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::fs;
 use std::hash::{Hash as _, Hasher};
@@ -45,6 +60,73 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, mpsc};
 use std::time::Instant;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) struct RenderProfile {
+    preferred_aspect_per_mille: Option<u16>,
+}
+
+impl RenderProfile {
+    fn from_preferred_aspect_ratio(ratio: Option<f32>) -> Self {
+        let preferred_aspect_per_mille = ratio
+            .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+            .map(|ratio| (ratio * 1000.0).round().clamp(100.0, 10_000.0) as u16);
+        Self {
+            preferred_aspect_per_mille,
+        }
+    }
+
+    fn preferred_aspect_ratio(self) -> Option<f32> {
+        self.preferred_aspect_per_mille
+            .map(|value| value as f32 / 1000.0)
+    }
+
+    #[cfg(feature = "renderer")]
+    fn cache_suffix(self) -> Option<String> {
+        self.preferred_aspect_per_mille
+            .map(|value| format!("_a{value}"))
+    }
+}
+
+thread_local! {
+    static RENDER_PROFILE_CONTEXT: Cell<RenderProfile> = Cell::new(RenderProfile::default());
+}
+
+fn current_render_profile() -> RenderProfile {
+    RENDER_PROFILE_CONTEXT.with(|profile| profile.get())
+}
+
+pub fn current_preferred_aspect_ratio_bucket() -> Option<u16> {
+    current_render_profile().preferred_aspect_per_mille
+}
+
+pub fn preferred_aspect_ratio_bucket(ratio: Option<f32>) -> Option<u16> {
+    RenderProfile::from_preferred_aspect_ratio(ratio).preferred_aspect_per_mille
+}
+
+struct RenderProfileGuard {
+    previous: RenderProfile,
+}
+
+impl Drop for RenderProfileGuard {
+    fn drop(&mut self) {
+        RENDER_PROFILE_CONTEXT.with(|profile| profile.set(self.previous));
+    }
+}
+
+fn push_render_profile(profile: RenderProfile) -> RenderProfileGuard {
+    let previous = RENDER_PROFILE_CONTEXT.with(|current| {
+        let previous = current.get();
+        current.set(profile);
+        previous
+    });
+    RenderProfileGuard { previous }
+}
+
+pub fn with_preferred_aspect_ratio<R>(ratio: Option<f32>, f: impl FnOnce() -> R) -> R {
+    let _guard = push_render_profile(RenderProfile::from_preferred_aspect_ratio(ratio));
+    f()
+}
 
 #[derive(Debug, Clone)]
 pub struct DiagramInfo {
@@ -124,6 +206,14 @@ pub use active::{
     set_streaming_preview_diagram, snapshot_active_diagrams,
 };
 
+#[path = "mermaid_model.rs"]
+mod model;
+pub use model::{
+    DiagramBlock, DiagramCacheKey, DiagramId, DiagramOrigin, DiagramRenderProfile,
+    DiagramRenderRequest, MermaidTheme, RenderArtifact, RenderError, RenderMode, RenderPriority,
+    RenderStatus, RenderTarget, normalize_aspect_ratio,
+};
+
 #[path = "mermaid_cache_render.rs"]
 mod cache_render;
 #[path = "mermaid_content.rs"]
@@ -137,46 +227,142 @@ mod widget_render;
 
 pub use cache_render::{
     RenderResult, deferred_render_epoch, get_cached_path, is_mermaid_lang, render_mermaid,
-    render_mermaid_deferred, render_mermaid_deferred_with_registration, render_mermaid_sized,
-    render_mermaid_untracked,
+    render_mermaid_deferred, render_mermaid_deferred_with_registration,
+    render_mermaid_deferred_with_stream_scope, render_mermaid_sized, render_mermaid_untracked,
 };
+#[cfg(feature = "renderer")]
+pub use content_render::terminal_theme;
 pub use content_render::{
     MermaidContent, diagram_placeholder_lines, error_to_lines, estimate_image_height,
     image_widget_placeholder_markdown, parse_image_placeholder, result_to_content, result_to_lines,
-    terminal_theme, write_video_export_marker,
+    write_video_export_marker,
 };
 pub use runtime::{
     error_lines_for, get_cached_png, get_font_size, image_protocol_available, init_picker,
     is_video_export_mode, protocol_type, register_external_image, register_inline_image,
     set_video_export_mode,
 };
-pub use viewport_render::{invalidate_render_state, render_image_widget_viewport};
+pub use viewport_render::{
+    invalidate_render_state, render_image_widget_viewport, render_image_widget_viewport_precise,
+};
 pub use widget_render::{render_image_widget, render_image_widget_fit, render_image_widget_scale};
 
+#[cfg(test)]
+use cache_render::calculate_render_size;
 use cache_render::{
     CachedDiagram, MermaidCache, RENDER_CACHE_MAX, RENDER_WIDTH_BUCKET_CELLS,
     bump_deferred_render_epoch, get_cached_diagram,
 };
-#[cfg(test)]
-use cache_render::{
-    cached_width_satisfies, calculate_render_size, estimate_diagram_size, parse_cache_filename,
-    retarget_svg_for_png,
-};
-#[cfg(test)]
-use content_render::image_widget_placeholder;
-#[cfg(test)]
-use runtime::{PickerInitMode, infer_protocol_from_env, picker_init_mode_from_probe_env};
 use viewport_render::clear_image_area;
-#[cfg(test)]
-use viewport_render::{ensure_kitty_viewport_state, render_kitty_virtual_viewport};
-#[cfg(test)]
-use widget_render::set_cell_if_visible;
 use widget_render::{BORDER_WIDTH, draw_left_border, render_stateful_image_safe};
 
-/// Render Mermaid source images a bit denser than the immediate terminal-pixel
-/// target so the terminal image protocol scales down from a sharper PNG.
-/// This especially helps small text remain legible in the pinned side pane.
-const RENDER_SUPERSAMPLE: f64 = 1.5;
+#[cfg(feature = "renderer")]
+#[derive(Debug, Clone, Copy)]
+struct MeasuredSvgDimensions {
+    width: f32,
+    height: f32,
+    viewbox_width: f32,
+    viewbox_height: f32,
+}
+
+#[cfg(all(
+    feature = "renderer",
+    not(all(feature = "mmdr-size-api", mmdr_size_api_available))
+))]
+fn measure_svg_dimensions_from_svg(
+    svg_source: &str,
+    output_dimensions: Option<(f32, f32)>,
+) -> MeasuredSvgDimensions {
+    let root_tag = svg_source
+        .find("<svg")
+        .and_then(|start| {
+            let end = svg_source[start..].find('>')? + start;
+            Some(&svg_source[start..=end])
+        })
+        .unwrap_or("");
+
+    let (viewbox_width, viewbox_height) = svg::parse_svg_viewbox_size(root_tag)
+        .or_else(|| svg::parse_svg_explicit_size(root_tag))
+        .unwrap_or((DEFAULT_RENDER_WIDTH as f32, DEFAULT_RENDER_HEIGHT as f32));
+
+    let (width, height) = if let Some((target_width, target_height)) = output_dimensions {
+        let target_width = target_width.max(1.0);
+        let target_height = target_height.max(1.0);
+        let scale = (target_width / viewbox_width.max(1.0))
+            .min(target_height / viewbox_height.max(1.0))
+            .max(0.0001);
+        (
+            (viewbox_width * scale).max(1.0),
+            (viewbox_height * scale).max(1.0),
+        )
+    } else {
+        svg::parse_svg_explicit_size(root_tag).unwrap_or((viewbox_width, viewbox_height))
+    };
+
+    MeasuredSvgDimensions {
+        width,
+        height,
+        viewbox_width,
+        viewbox_height,
+    }
+}
+
+#[cfg(all(
+    feature = "renderer",
+    not(all(feature = "mmdr-size-api", mmdr_size_api_available))
+))]
+fn render_svg_for_png(
+    layout: &Layout,
+    theme: &Theme,
+    layout_config: &LayoutConfig,
+    output_dimensions: Option<(f32, f32)>,
+) -> (String, MeasuredSvgDimensions) {
+    let svg_source = render_svg(layout, theme, layout_config);
+    let dimensions = measure_svg_dimensions_from_svg(&svg_source, output_dimensions);
+    let svg = if let Some((target_width, target_height)) = output_dimensions {
+        svg::retarget_svg_for_png(&svg_source, target_width as f64, target_height as f64)
+    } else {
+        svg_source
+    };
+    (svg, dimensions)
+}
+
+#[cfg(all(
+    feature = "renderer",
+    feature = "mmdr-size-api",
+    mmdr_size_api_available
+))]
+fn render_svg_for_png(
+    layout: &Layout,
+    theme: &Theme,
+    layout_config: &LayoutConfig,
+    output_dimensions: Option<(f32, f32)>,
+) -> (String, MeasuredSvgDimensions) {
+    let dimensions = mmdr_measure_svg_dimensions(layout, layout_config, output_dimensions);
+    let svg = mmdr_render_svg_with_dimensions(layout, theme, layout_config, output_dimensions);
+    (
+        svg,
+        MeasuredSvgDimensions {
+            width: dimensions.width,
+            height: dimensions.height,
+            viewbox_width: dimensions.viewbox_width,
+            viewbox_height: dimensions.viewbox_height,
+        },
+    )
+}
+
+fn render_size_backend() -> &'static str {
+    if cfg!(all(feature = "mmdr-size-api", mmdr_size_api_available)) {
+        "mmdr-size-api"
+    } else {
+        "svg-retarget-fallback"
+    }
+}
+
+/// Render Mermaid source images slightly denser than the immediate terminal-pixel
+/// target so the terminal image protocol scales down from a sharper PNG without
+/// making SVG-to-PNG rasterization dominate interactive frames.
+const RENDER_SUPERSAMPLE: f64 = 1.1;
 const DEFAULT_RENDER_WIDTH: u32 = 2400;
 const DEFAULT_RENDER_HEIGHT: u32 = 1800;
 const DEFAULT_PICKER_FONT_SIZE: (u16, u16) = (8, 16);
@@ -202,9 +388,12 @@ static RENDER_CACHE: LazyLock<Mutex<MermaidCache>> =
 /// naturally refreshed on the next redraw.
 static DEFERRED_RENDER_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+type PendingRenderKey = (u64, u32, RenderProfile);
+type PendingRenderMap = HashMap<PendingRenderKey, PendingDeferredRender>;
+
 /// Background mermaid renders currently queued or in flight, keyed by
-/// (content hash, target width).
-static PENDING_RENDER_REQUESTS: LazyLock<Mutex<HashMap<(u64, u32), PendingDeferredRender>>> =
+/// (content hash, target width, render profile).
+static PENDING_RENDER_REQUESTS: LazyLock<Mutex<PendingRenderMap>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Sender for the shared deferred Mermaid render worker.
@@ -217,6 +406,7 @@ static SVG_FONT_DB_PREWARM_STARTED: OnceLock<()> = OnceLock::new();
 /// defense-in-depth, so we keep only one active render at a time. This also
 /// prevents duplicate expensive work when a background streaming render and a
 /// foreground final render race for the same diagram.
+#[cfg(feature = "renderer")]
 static RENDER_WORK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Reuse a loaded system font database across Mermaid PNG renders.
@@ -425,6 +615,7 @@ impl KittyViewportCache {
         }
     }
 
+    #[cfg(feature = "renderer")]
     fn remove(&mut self, hash: &u64) {
         self.entries.remove(hash);
         if let Some(pos) = self.order.iter().position(|h| h == hash) {
@@ -510,6 +701,7 @@ pub struct MermaidDebugStats {
     pub cache_misses: u64,
     pub deferred_enqueued: u64,
     pub deferred_deduped: u64,
+    pub deferred_superseded: u64,
     pub deferred_worker_renders: u64,
     pub deferred_worker_skips: u64,
     pub deferred_epoch_bumps: u64,
@@ -537,8 +729,13 @@ pub struct MermaidDebugStats {
     pub cache_entries: usize,
     pub cache_dir: Option<String>,
     pub protocol: Option<String>,
+    pub render_size_backend: &'static str,
     pub last_png_width: Option<u32>,
     pub last_png_height: Option<u32>,
+    pub last_measured_width: Option<u32>,
+    pub last_measured_height: Option<u32>,
+    pub last_viewbox_width: Option<u32>,
+    pub last_viewbox_height: Option<u32>,
     pub last_target_width: Option<u32>,
     pub last_target_height: Option<u32>,
     pub deferred_pending: usize,
@@ -553,24 +750,32 @@ struct MermaidDebugState {
 static MERMAID_DEBUG: LazyLock<Mutex<MermaidDebugState>> =
     LazyLock::new(|| Mutex::new(MermaidDebugState::default()));
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct PendingDeferredRender {
     register_active: bool,
+    terminal_width: Option<u16>,
+    content: String,
+    stream_scope: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 struct DeferredRenderTask {
     content: String,
     terminal_width: Option<u16>,
-    render_key: (u64, u32),
+    render_key: (u64, u32, RenderProfile),
 }
 
+#[cfg(feature = "renderer")]
 #[derive(Debug, Clone, Copy, Default)]
 struct RenderStageBreakdown {
     parse_ms: f32,
     layout_ms: f32,
     svg_ms: f32,
     png_ms: f32,
+    measured_width: u32,
+    measured_height: u32,
+    viewbox_width: u32,
+    viewbox_height: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -693,6 +898,7 @@ pub fn debug_flicker_benchmark(steps: usize) -> MermaidFlickerBenchmark {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn parse_proc_status_value_bytes(status: &str, key: &str) -> Option<u64> {
     debug_support::parse_proc_status_value_bytes(status, key)
 }

@@ -168,7 +168,7 @@ fn single_session_typography_targets_jetbrains_mono_light_nerd() {
     );
     assert_eq!(
         SINGLE_SESSION_BODY_FONT_SIZE,
-        SINGLE_SESSION_DEFAULT_FONT_SIZE + 3.0
+        SINGLE_SESSION_CODE_FONT_SIZE * 1.5
     );
     assert_eq!(
         SINGLE_SESSION_META_FONT_SIZE,
@@ -231,17 +231,22 @@ fn vertices_have_bottom_center_rule(vertices: &[Vertex], color: [f32; 4]) -> boo
 }
 
 #[test]
-fn fresh_single_session_does_not_draw_separate_welcome_chrome() {
+fn fresh_single_session_restores_dominant_welcome_hero_without_input_hline() {
     let mut app = SingleSessionApp::new(None);
     let size = PhysicalSize::new(900, 700);
     let tick_zero = build_single_session_vertices(&app, size, 0.0, 0);
-    let old_welcome_aurora_blue = [0.250, 0.520, 1.000, 0.145];
 
-    assert!(!vertices_have_color(&tick_zero, old_welcome_aurora_blue));
+    assert!(vertices_have_color(&tick_zero, WELCOME_AURORA_BLUE));
+    assert!(vertices_have_color(&tick_zero, WELCOME_HANDWRITING_COLOR));
+    assert!(!vertices_have_color(
+        &tick_zero,
+        [0.060, 0.085, 0.145, 0.34]
+    ));
 
     app.handle_key(KeyInput::Character("hello".to_string()));
     let typed = build_single_session_vertices(&app, size, 0.0, 18);
-    assert!(!vertices_have_color(&typed, old_welcome_aurora_blue));
+    assert!(vertices_have_color(&typed, WELCOME_AURORA_BLUE));
+    assert!(!vertices_have_color(&typed, [0.060, 0.085, 0.145, 0.34]));
 }
 
 #[test]
@@ -255,7 +260,6 @@ fn fresh_single_session_offers_crashed_recovery_without_auto_opening() {
         .map(|line| line.text.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-
     assert!(body.contains("Found 3 crashed session(s)"));
     assert!(body.contains("Press Ctrl+R"));
     assert_eq!(
@@ -300,21 +304,19 @@ fn single_session_active_work_uses_native_spinner_geometry() {
 }
 
 #[test]
-fn single_session_streaming_response_uses_line_reveal_shimmer() {
+fn single_session_streaming_response_does_not_draw_line_reveal_shimmer() {
     let mut app = SingleSessionApp::new(None);
     let size = PhysicalSize::new(900, 700);
-    assert!(single_session_streaming_shimmer(&app, size, 0).is_none());
+    const REMOVED_SHIMMER_SOFT_COLOR: [f32; 4] = [0.220, 0.520, 0.780, 0.055];
+    const REMOVED_SHIMMER_CORE_COLOR: [f32; 4] = [0.220, 0.520, 0.780, 0.115];
 
     app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
         "streaming answer".to_string(),
     ));
-    let tick_zero = single_session_streaming_shimmer(&app, size, 0).expect("streaming shimmer");
-    let tick_one = single_session_streaming_shimmer(&app, size, 8).expect("streaming shimmer");
+    let vertices = build_single_session_vertices(&app, size, 0.0, 0);
 
-    assert!(tick_zero.soft_rect.width > tick_zero.core_rect.width);
-    assert_eq!(tick_zero.soft_rect.y, tick_zero.core_rect.y);
-    assert_eq!(tick_zero.soft_rect.height, tick_zero.core_rect.height);
-    assert!(tick_one.core_rect.x > tick_zero.core_rect.x);
+    assert!(!vertices_have_color(&vertices, REMOVED_SHIMMER_SOFT_COLOR));
+    assert!(!vertices_have_color(&vertices, REMOVED_SHIMMER_CORE_COLOR));
 }
 
 #[test]
@@ -378,9 +380,9 @@ fn single_session_composer_uses_next_prompt_number_and_status_footer() {
     assert!(app.composer_status_line().contains("Ctrl+Enter queue/send"));
     assert!(!app.composer_status_line().contains("scrolled up"));
 
-    app.scroll_body_lines(1);
+    app.scroll_body_lines(1.0);
     assert!(app.composer_status_line().contains("scrolled up 1 line"));
-    app.scroll_body_lines(2);
+    app.scroll_body_lines(2.0);
     assert!(app.composer_status_line().contains("scrolled up 3 lines"));
     app.scroll_body_to_bottom();
     assert!(!app.composer_status_line().contains("scrolled up"));
@@ -402,6 +404,199 @@ fn single_session_composer_uses_next_prompt_number_and_status_footer() {
 }
 
 #[test]
+fn single_session_slash_help_opens_help_without_sending_prompt() {
+    let mut app = SingleSessionApp::new(None);
+    app.handle_key(KeyInput::Character("/help".to_string()));
+
+    assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
+    assert!(app.show_help);
+    assert!(app.draft.is_empty());
+    assert!(app.messages.is_empty());
+    let help = app
+        .inline_widget_styled_lines()
+        .into_iter()
+        .map(|line| line.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(help.contains("slash commands"));
+    assert!(help.contains("/model [name]"));
+}
+
+#[test]
+fn single_session_info_hotkey_toggles_inline_session_stats() {
+    let mut app = SingleSessionApp::new(Some(test_session_card(
+        "session_info_1234567890",
+        "Info Session",
+        "ready",
+    )));
+    app.messages
+        .push(SingleSessionMessage::user("what happened?"));
+    app.messages
+        .push(SingleSessionMessage::assistant("a useful answer"));
+    app.messages.push(SingleSessionMessage::tool("read file"));
+    app.streaming_response = "still streaming".to_string();
+    app.status = Some("receiving".to_string());
+    app.model_picker.current_model = Some("claude-sonnet-4-5".to_string());
+    app.model_picker.provider_name = Some("Claude".to_string());
+
+    assert_eq!(
+        app.handle_key(KeyInput::ToggleSessionInfo),
+        KeyOutcome::Redraw
+    );
+    assert!(app.show_session_info);
+    let info = app
+        .inline_widget_styled_lines()
+        .into_iter()
+        .map(|line| line.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(info.contains("session info"));
+    assert!(info.contains("Info Session"));
+    assert!(info.contains("session_info_1234567890"));
+    assert!(info.contains("receiving"));
+    assert!(info.contains("Claude · claude-sonnet-4-5"));
+    assert!(info.contains("3 total · 1 user · 1 assistant · 1 tool"));
+    assert!(info.contains("streaming 15 chars"));
+
+    assert_eq!(app.handle_key(KeyInput::Escape), KeyOutcome::Redraw);
+    assert!(!app.show_session_info);
+    assert!(app.inline_widget_styled_lines().is_empty());
+}
+
+#[test]
+fn single_session_status_slash_opens_inline_session_info() {
+    let mut app = SingleSessionApp::new(None);
+    app.handle_key(KeyInput::Character("/status".to_string()));
+
+    assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
+    assert!(app.show_session_info);
+    assert!(app.draft.is_empty());
+    assert!(
+        app.messages.is_empty(),
+        "/status should not append a transcript meta row"
+    );
+    let info = app
+        .inline_widget_styled_lines()
+        .into_iter()
+        .map(|line| line.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(info.contains("fresh / not started"));
+    assert!(info.contains("tokens"));
+}
+
+#[test]
+fn single_session_slash_model_with_argument_requests_model_switch() {
+    let mut app = SingleSessionApp::new(None);
+    app.draft = "/model gpt-5.5".to_string();
+    app.draft_cursor = app.draft.len();
+
+    assert_eq!(
+        app.handle_key(KeyInput::SubmitDraft),
+        KeyOutcome::SetModel("gpt-5.5".to_string())
+    );
+    assert!(app.draft.is_empty());
+    assert!(app.messages.is_empty());
+}
+
+#[test]
+fn single_session_typing_model_slash_opens_preview_picker_without_submitting() {
+    let mut app = SingleSessionApp::new(None);
+
+    assert_eq!(
+        app.handle_key(KeyInput::Character("/model opus".to_string())),
+        KeyOutcome::LoadModelCatalog
+    );
+    assert!(app.model_picker.open);
+    assert!(app.model_picker.preview);
+    assert_eq!(app.draft, "/model opus");
+    assert_eq!(app.model_picker.filter, "opus");
+
+    app.apply_session_event(session_launch::DesktopSessionEvent::ModelCatalog {
+        current_model: Some("claude-sonnet-4-5".to_string()),
+        provider_name: Some("Claude".to_string()),
+        models: vec![session_launch::DesktopModelChoice {
+            model: "claude-opus-4-5".to_string(),
+            provider: Some("claude".to_string()),
+            api_method: Some("oauth".to_string()),
+            detail: Some("premium".to_string()),
+            available: true,
+        }],
+    });
+
+    let body = app.body_lines().join("\n");
+    assert!(!body.contains("MODEL"));
+    let picker = app
+        .inline_widget_styled_lines()
+        .into_iter()
+        .map(|line| line.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(picker.contains("MODEL"));
+    assert!(picker.contains("PROVIDER"));
+    assert!(picker.contains("METHOD"));
+    assert!(picker.contains("\"opus\""));
+
+    assert_eq!(
+        app.handle_key(KeyInput::SubmitDraft),
+        KeyOutcome::SetModel("claude-opus-4-5".to_string())
+    );
+    assert!(!app.model_picker.open);
+    assert!(app.draft.is_empty());
+    assert!(app.messages.is_empty());
+}
+
+#[test]
+fn single_session_unknown_slash_command_stays_local() {
+    let mut app = SingleSessionApp::new(None);
+    app.handle_key(KeyInput::Character("/definitely-not-real".to_string()));
+
+    assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
+    assert!(app.messages.is_empty());
+    assert_eq!(app.draft, "/definitely-not-real");
+    assert!(
+        app.status
+            .as_deref()
+            .is_some_and(|status| status.contains("unknown desktop slash command"))
+    );
+}
+
+#[test]
+fn single_session_slash_copy_uses_latest_assistant_response_without_submitting() {
+    let mut app = SingleSessionApp::new(None);
+    app.messages
+        .push(SingleSessionMessage::assistant("completed answer"));
+    app.handle_key(KeyInput::Character("/copy".to_string()));
+
+    assert_eq!(
+        app.handle_key(KeyInput::SubmitDraft),
+        KeyOutcome::CopyLatestResponse("completed answer".to_string())
+    );
+    assert!(app.draft.is_empty());
+    assert_eq!(app.messages.len(), 1);
+
+    app.handle_key(KeyInput::Character("/copy".to_string()));
+    app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
+        "streaming answer".to_string(),
+    ));
+    assert_eq!(
+        app.handle_key(KeyInput::SubmitDraft),
+        KeyOutcome::CopyLatestResponse("streaming answer".to_string())
+    );
+}
+
+#[test]
+fn single_session_slash_copy_reports_missing_response_locally() {
+    let mut app = SingleSessionApp::new(None);
+    app.handle_key(KeyInput::Character("/copy".to_string()));
+
+    assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
+    assert!(app.messages.is_empty());
+    assert!(app.draft.is_empty());
+    assert_eq!(app.status.as_deref(), Some("no assistant response to copy"));
+}
+
+#[test]
 fn single_session_transcript_roles_render_without_stringly_labels() {
     let mut app = SingleSessionApp::new(None);
     app.messages.push(SingleSessionMessage::user("question"));
@@ -415,7 +610,7 @@ fn single_session_transcript_roles_render_without_stringly_labels() {
     let body = app.body_lines().join("\n");
     assert!(body.contains("1  question"));
     assert!(body.contains("answer"));
-    assert!(body.contains("• using tool bash"));
+    assert!(body.contains("  using tool bash"));
     assert!(body.contains("  system note"));
     assert!(body.contains("  meta note"));
     assert!(!body.contains("user:"));
@@ -430,13 +625,13 @@ fn single_session_assistant_markdown_is_prepared_for_desktop_rendering() {
     ));
 
     let body = app.body_lines().join("\n");
-    assert!(body.contains("# Plan"));
+    assert!(body.contains("Plan"));
     assert!(body.contains("• first"));
     assert!(body.contains("• second"));
     assert!(body.contains("Use `cargo test`."));
-    assert!(body.contains("``` rust"));
-    assert!(body.contains("    fn main() {}"));
-    assert!(body.contains("```"));
+    assert!(body.contains("  rust"));
+    assert!(body.contains("  fn main() {}"));
+    assert!(!body.contains("```"));
 }
 
 #[test]
@@ -453,31 +648,105 @@ fn single_session_markdown_renderer_handles_rich_commonmark_shapes() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(body.contains("## Results"));
+    assert!(body.contains("Results"));
     assert_eq!(
-        style_for_text(&lines, "## Results"),
+        style_for_text(&lines, "Results"),
         Some(SingleSessionLineStyle::AssistantHeading)
     );
-    assert!(body.contains("▌ quote line"));
-    assert!(body.contains("▌ continues"));
+    assert!(body.contains("│ quote line continues"));
     assert_eq!(
-        style_for_text(&lines, "▌ quote line"),
+        style_for_text(&lines, "│ quote line continues"),
         Some(SingleSessionLineStyle::AssistantQuote)
     );
     assert!(body.contains("1. first"));
     assert!(body.contains("2. second"));
-    assert!(body.contains("docs ↗ https://example.com and **bold** plus _em_."));
+    assert!(body.contains("docs ↗ https://example.com and bold plus em."));
     assert_eq!(
-        style_for_text(&lines, "docs ↗ https://example.com and **bold** plus _em_."),
+        style_for_text(&lines, "docs ↗ https://example.com and bold plus em."),
         Some(SingleSessionLineStyle::AssistantLink)
     );
-    assert!(body.contains("┆ name │ value"));
-    assert!(body.contains("┆ alpha │ 42"));
+    assert!(body.contains("name  │ value"));
+    assert!(body.contains("alpha │ 42"));
+    assert!(body.contains("──────┼──────"));
     assert_eq!(
-        style_for_text(&lines, "┆ alpha │ 42"),
+        style_for_text(&lines, "alpha │ 42"),
         Some(SingleSessionLineStyle::AssistantTable)
     );
-    assert!(body.contains("───"));
+    assert!(body.contains("────────────"));
+}
+
+#[test]
+fn single_session_markdown_renderer_scopes_links_and_structures_lists() {
+    let mut app = SingleSessionApp::new(None);
+    app.messages.push(SingleSessionMessage::assistant(
+        "This is\none paragraph with [docs](https://example.com).\n\nNext paragraph.\n\n- [x] shipped\n- [ ] polish\n  - nested",
+    ));
+
+    let lines = app.body_styled_lines();
+    let body = lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(body.contains("This is one paragraph with docs ↗ https://example.com."));
+    assert_eq!(
+        style_for_text(
+            &lines,
+            "This is one paragraph with docs ↗ https://example.com."
+        ),
+        Some(SingleSessionLineStyle::AssistantLink)
+    );
+    assert_eq!(
+        style_for_text(&lines, "Next paragraph."),
+        Some(SingleSessionLineStyle::Assistant)
+    );
+    assert!(body.contains("✓ shipped"));
+    assert!(body.contains("☐ polish"));
+    assert!(body.contains("  ◦ nested"));
+}
+
+#[test]
+fn single_session_streaming_markdown_renders_before_done() {
+    let mut app = SingleSessionApp::new(None);
+    app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
+        "## Streaming\n\n- first\n- [x] shipped\n\n[docs]".to_string(),
+    ));
+    app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
+        "(https://example.com)\n\n```rust\nfn main() {}".to_string(),
+    ));
+
+    let lines = app.body_styled_lines();
+    let body = lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(body.contains("Streaming"));
+    assert_eq!(
+        style_for_text(&lines, "Streaming"),
+        Some(SingleSessionLineStyle::AssistantHeading)
+    );
+    assert!(body.contains("• first"));
+    assert!(body.contains("✓ shipped"));
+    assert!(body.contains("docs ↗ https://example.com"));
+    assert_eq!(
+        style_for_text(&lines, "docs ↗ https://example.com"),
+        Some(SingleSessionLineStyle::AssistantLink)
+    );
+    assert!(body.contains("  rust"));
+    assert!(body.contains("  fn main() {}"));
+    assert!(!body.contains("```"));
+
+    app.apply_session_event(session_launch::DesktopSessionEvent::Done);
+    let finished_body = app.body_lines().join("\n");
+    assert!(finished_body.contains("Streaming"));
+    assert!(finished_body.contains("• first"));
+    assert!(finished_body.contains("✓ shipped"));
+    assert!(finished_body.contains("docs ↗ https://example.com"));
+    assert!(finished_body.contains("  fn main() {}"));
+    assert!(!finished_body.contains("```"));
 }
 
 #[test]
@@ -491,19 +760,19 @@ fn single_session_markdown_structure_uses_distinct_colors_and_cards() {
     let buffers = single_session_text_buffers(&app, PhysicalSize::new(1200, 760), &mut font_system);
     let body = &buffers[1];
     assert_eq!(
-        first_glyph_color_for_text(body, "# Heading"),
+        first_glyph_color_for_text(body, "Heading"),
         Some(single_session_line_color(
             SingleSessionLineStyle::AssistantHeading
         ))
     );
     assert_eq!(
-        first_glyph_color_for_text(body, "▌ quoted"),
+        first_glyph_color_for_text(body, "│ quoted"),
         Some(single_session_line_color(
             SingleSessionLineStyle::AssistantQuote
         ))
     );
     assert_eq!(
-        first_glyph_color_for_text(body, "┆ c │ d"),
+        first_glyph_color_for_text(body, "c │ d"),
         Some(single_session_line_color(
             SingleSessionLineStyle::AssistantTable
         ))
@@ -597,11 +866,22 @@ fn desktop_arrow_word_navigation_maps_common_modifiers() {
     );
     assert_eq!(
         to_key_input(&Key::Named(NamedKey::ArrowLeft), ModifiersState::ALT),
-        KeyInput::MoveCursorWordLeft
+        KeyInput::CycleReasoningEffort(-1)
     );
     assert_eq!(
         to_key_input(&Key::Named(NamedKey::ArrowRight), ModifiersState::ALT),
-        KeyInput::MoveCursorWordRight
+        KeyInput::CycleReasoningEffort(1)
+    );
+}
+
+#[test]
+fn desktop_maps_session_info_hotkey() {
+    assert_eq!(
+        to_key_input(
+            &Key::Character("s".into()),
+            ModifiersState::CONTROL | ModifiersState::SHIFT
+        ),
+        KeyInput::ToggleSessionInfo
     );
 }
 
@@ -642,6 +922,100 @@ fn desktop_maps_terminal_editing_shortcuts_from_tui() {
 }
 
 #[test]
+fn desktop_maps_text_scale_shortcuts() {
+    assert_eq!(
+        to_key_input(&Key::Character("-".into()), ModifiersState::CONTROL),
+        KeyInput::AdjustTextScale(-1)
+    );
+    assert_eq!(
+        to_key_input(&Key::Character("=".into()), ModifiersState::CONTROL),
+        KeyInput::AdjustTextScale(1)
+    );
+    assert_eq!(
+        to_key_input(&Key::Character("+".into()), ModifiersState::CONTROL),
+        KeyInput::AdjustTextScale(1)
+    );
+    assert_eq!(
+        to_key_input(&Key::Character("0".into()), ModifiersState::CONTROL),
+        KeyInput::ResetTextScale
+    );
+}
+
+#[test]
+fn single_session_draft_selection_extracts_text_and_highlights_prompt_offset() {
+    let mut app = SingleSessionApp::new(None);
+    app.handle_key(KeyInput::Character("hello\nworld".to_string()));
+
+    app.begin_draft_selection(SelectionPoint { line: 0, column: 2 });
+    app.update_draft_selection(SelectionPoint { line: 1, column: 3 });
+
+    assert_eq!(
+        app.draft_selection_segments(),
+        vec![
+            SelectionLineSegment {
+                line: 0,
+                start_column: app.composer_prompt().chars().count() + 2,
+                end_column: app.composer_prompt().chars().count() + 5,
+            },
+            SelectionLineSegment {
+                line: 1,
+                start_column: 0,
+                end_column: 3,
+            },
+        ]
+    );
+
+    let vertices = build_single_session_vertices(&app, PhysicalSize::new(900, 700), 0.0, 0);
+    assert!(vertices_have_color(&vertices, SELECTION_HIGHLIGHT_COLOR));
+    assert_eq!(app.selected_draft_text(), Some("llo\nwor".to_string()));
+}
+
+#[test]
+fn single_session_paste_and_typing_replace_draft_selection() {
+    let mut app = SingleSessionApp::new(None);
+    app.handle_key(KeyInput::Character("hello world".to_string()));
+    app.begin_draft_selection(SelectionPoint { line: 0, column: 6 });
+    app.update_draft_selection(SelectionPoint {
+        line: 0,
+        column: 11,
+    });
+
+    app.paste_text("there");
+
+    assert_eq!(app.composer_text(), "1› hello there");
+    assert_eq!(app.draft_cursor_line_col(), (0, 11));
+
+    app.begin_draft_selection(SelectionPoint { line: 0, column: 6 });
+    app.update_draft_selection(SelectionPoint {
+        line: 0,
+        column: 11,
+    });
+    assert_eq!(
+        app.handle_key(KeyInput::Character("friend".to_string())),
+        KeyOutcome::Redraw
+    );
+
+    assert_eq!(app.composer_text(), "1› hello friend");
+    assert_eq!(app.draft_cursor_line_col(), (0, 12));
+}
+
+#[test]
+fn single_session_delete_removes_draft_selection() {
+    let mut app = SingleSessionApp::new(None);
+    app.handle_key(KeyInput::Character("hello world".to_string()));
+    app.begin_draft_selection(SelectionPoint { line: 0, column: 5 });
+    app.update_draft_selection(SelectionPoint {
+        line: 0,
+        column: 11,
+    });
+
+    assert_eq!(app.handle_key(KeyInput::Backspace), KeyOutcome::Redraw);
+
+    assert_eq!(app.composer_text(), "1› hello");
+    assert_eq!(app.draft_cursor_line_col(), (0, 5));
+}
+
+#[test]
 fn single_session_cut_and_retrieve_queued_draft_match_tui_shortcuts() {
     let mut app = SingleSessionApp::new(None);
     app.handle_key(KeyInput::Character("cut me".to_string()));
@@ -664,7 +1038,11 @@ fn single_session_cut_and_retrieve_queued_draft_match_tui_shortcuts() {
 
 #[test]
 fn single_session_header_exposes_desktop_binary_and_version() {
-    let mut app = SingleSessionApp::new(None);
+    let mut app = SingleSessionApp::new(Some(test_session_card(
+        "session_header",
+        "session header",
+        "active",
+    )));
     app.apply_session_event(session_launch::DesktopSessionEvent::SessionStarted {
         session_id: "session_header".to_string(),
     });
@@ -680,13 +1058,14 @@ fn single_session_header_exposes_desktop_binary_and_version() {
 }
 
 #[test]
-fn fresh_single_session_startup_puts_greeting_in_transcript() {
+fn fresh_single_session_startup_puts_greeting_in_welcome_hero() {
     let app = SingleSessionApp::new(None);
     let key = single_session_text_key(&app, PhysicalSize::new(900, 700));
 
     assert_eq!(key.title, "");
-    assert_visual_text_contains(&key, "Hello there");
-    assert!(key.welcome_hero.is_empty());
+    assert_is_handwritten_welcome_phrase(&key.welcome_hero);
+    assert_visual_text_contains(&key, &key.welcome_hero);
+    assert!(key.body.is_empty());
     assert!(key.welcome_hint.is_empty());
 }
 
@@ -700,21 +1079,69 @@ fn single_session_text_buffers_include_header_version_area() {
     let mut font_system = FontSystem::new();
     let buffers = single_session_text_buffers(&app, size, &mut font_system);
 
-    assert_eq!(buffers.len(), 6);
+    assert_eq!(buffers.len(), 7);
     assert_eq!(single_session_text_areas(&buffers, size).len(), 5);
 }
 
 #[test]
-fn fresh_welcome_greeting_is_transcript_text_not_handwritten_chrome() {
+fn fresh_welcome_greeting_uses_handwritten_hero_chrome() {
     let app = SingleSessionApp::new(None);
     let key = single_session_text_key(&app, PhysicalSize::new(1000, 720));
-    let old_handwriting_color = [0.012, 0.080, 0.250, 0.94];
     let vertices = build_single_session_vertices(&app, PhysicalSize::new(1000, 720), 0.0, 0);
 
-    assert_visual_text_contains(&key, "Hello there");
-    assert!(key.welcome_hero.is_empty());
+    assert_is_handwritten_welcome_phrase(&key.welcome_hero);
+    assert_visual_text_contains(&key, &key.welcome_hero);
     assert!(key.welcome_hint.is_empty());
-    assert!(!vertices_have_color(&vertices, old_handwriting_color));
+    assert!(vertices_have_color(&vertices, WELCOME_HANDWRITING_COLOR));
+}
+
+#[test]
+fn fresh_welcome_handwriting_reveals_over_time() {
+    let app = SingleSessionApp::new(None);
+    let size = PhysicalSize::new(1000, 720);
+    let early = build_single_session_vertices(&app, size, 0.0, 0);
+    let middle = build_single_session_vertices(&app, size, 0.0, 4);
+    let done = build_single_session_vertices(&app, size, 0.0, 10);
+
+    let early_ink = vertices_with_color_count(&early, WELCOME_HANDWRITING_COLOR);
+    let middle_ink = vertices_with_color_count(&middle, WELCOME_HANDWRITING_COLOR);
+    let done_ink = vertices_with_color_count(&done, WELCOME_HANDWRITING_COLOR);
+
+    assert!(early_ink > 0, "first frame should show initial ink");
+    assert!(
+        early_ink < middle_ink,
+        "handwritten ink should grow during reveal: early={early_ink}, middle={middle_ink}"
+    );
+    assert_eq!(
+        done_ink, 0,
+        "completed reveal should hand off to the clean font without overlapping stroke ink"
+    );
+    assert!(vertices_have_color(&middle, WELCOME_HANDWRITING_COLOR));
+    assert!(!vertices_have_color(&done, WELCOME_HANDWRITING_COLOR));
+}
+
+#[test]
+fn welcome_hero_reveal_progress_eases_to_full() {
+    let start = welcome_hero_reveal_progress_for_elapsed(Duration::ZERO);
+    let middle = welcome_hero_reveal_progress_for_elapsed(Duration::from_millis(675));
+    let done = welcome_hero_reveal_progress_for_elapsed(Duration::from_millis(1350));
+
+    assert!(start > 0.0 && start < middle);
+    assert!(middle < done);
+    assert_eq!(done, 1.0);
+    assert!(welcome_hero_reveal_is_active(start));
+    assert!(welcome_hero_reveal_is_active(middle));
+    assert!(!welcome_hero_reveal_is_active(done));
+}
+
+#[test]
+fn handwritten_welcome_phrase_set_has_stable_curated_variants() {
+    assert_eq!(HANDWRITTEN_WELCOME_PHRASES.len(), 1);
+    assert_eq!(handwritten_welcome_phrase(0), "Hello there");
+    assert_eq!(
+        handwritten_welcome_phrase(HANDWRITTEN_WELCOME_PHRASES.len()),
+        handwritten_welcome_phrase(0)
+    );
 }
 
 #[test]
@@ -753,10 +1180,9 @@ fn single_session_visual_state_smoke_covers_markdown_spinner_and_switcher() {
     let markdown_key = single_session_text_key(&markdown_app, size);
     assert_eq!(markdown_key.title, "");
     assert!(markdown_key.status.starts_with("receiving"));
-    assert_visual_text_contains(&markdown_key, "# Heading");
-    assert_visual_text_contains(&markdown_key, "▌ quoted");
+    assert_visual_text_contains(&markdown_key, "│ quoted");
     assert_visual_text_contains(&markdown_key, "docs ↗ https://example.com");
-    assert_visual_text_contains(&markdown_key, "┆ color │ yes");
+    assert_visual_text_contains(&markdown_key, "color │ yes");
     assert_visual_text_contains(&markdown_key, "streaming tail");
 
     let markdown_vertices = build_single_session_vertices(&markdown_app, size, 0.0, 0);
@@ -798,12 +1224,38 @@ fn single_session_body_styled_lines_follow_roles_and_overlays() {
 
     let lines = app.body_styled_lines();
     let segments = single_session_styled_text_segments(&lines);
-    assert!(segments.contains(&("1".to_string(), user_prompt_number_color(1))));
-    assert!(segments.contains(&("› ".to_string(), text_color(USER_PROMPT_ACCENT_COLOR))));
-    assert!(segments.contains(&(
-        "question".to_string(),
-        single_session_line_color(SingleSessionLineStyle::User)
-    )));
+    assert!(
+        segments.contains(&(
+            "1",
+            Attrs::new()
+                .family(Family::Name(SINGLE_SESSION_FONT_FAMILY))
+                .color(user_prompt_number_color(2))
+        ))
+    );
+    assert!(
+        segments.contains(&(
+            "› ",
+            Attrs::new()
+                .family(Family::Name(SINGLE_SESSION_FONT_FAMILY))
+                .color(text_color(USER_PROMPT_ACCENT_COLOR))
+        ))
+    );
+    assert!(
+        segments.contains(&(
+            "question",
+            Attrs::new()
+                .family(Family::Name(SINGLE_SESSION_FONT_FAMILY))
+                .color(single_session_line_color(SingleSessionLineStyle::User))
+        ))
+    );
+    assert!(
+        segments.contains(&(
+            "answer",
+            Attrs::new()
+                .family(Family::Name(SINGLE_SESSION_ASSISTANT_FONT_FAMILY))
+                .color(single_session_line_color(SingleSessionLineStyle::Assistant))
+        ))
+    );
 
     assert_eq!(
         style_for_text(&lines, "1  question"),
@@ -818,15 +1270,15 @@ fn single_session_body_styled_lines_follow_roles_and_overlays() {
         Some(SingleSessionLineStyle::Assistant)
     );
     assert_eq!(
-        style_for_text(&lines, "``` rust"),
+        style_for_text(&lines, "  rust"),
         Some(SingleSessionLineStyle::Code)
     );
     assert_eq!(
-        style_for_text(&lines, "    fn main() {}"),
+        style_for_text(&lines, "  fn main() {}"),
         Some(SingleSessionLineStyle::Code)
     );
     assert_eq!(
-        style_for_text(&lines, "• bash done"),
+        style_for_text(&lines, "  bash done"),
         Some(SingleSessionLineStyle::Tool)
     );
     assert_eq!(
@@ -835,7 +1287,7 @@ fn single_session_body_styled_lines_follow_roles_and_overlays() {
     );
 
     app.handle_key(KeyInput::HotkeyHelp);
-    let help = app.body_styled_lines();
+    let help = app.inline_widget_styled_lines();
     assert_eq!(
         style_for_text(&help, "desktop shortcuts"),
         Some(SingleSessionLineStyle::OverlayTitle)
@@ -850,8 +1302,47 @@ fn single_session_body_styled_lines_follow_roles_and_overlays() {
 }
 
 #[test]
+fn assistant_symbol_lines_use_main_font_to_avoid_missing_glyph_boxes() {
+    let symbol_line = "docs ↗ https://example.com";
+    let symbol_lines = [SingleSessionStyledLine {
+        text: symbol_line.to_string(),
+        style: SingleSessionLineStyle::AssistantLink,
+    }];
+    let symbol_segments = single_session_styled_text_segments(&symbol_lines);
+    assert!(
+        symbol_segments.contains(&(
+            symbol_line,
+            Attrs::new()
+                .family(Family::Name(SINGLE_SESSION_FONT_FAMILY))
+                .color(single_session_line_color(
+                    SingleSessionLineStyle::AssistantLink
+                ))
+        ))
+    );
+
+    let plain_line = "plain assistant prose";
+    let plain_lines = [SingleSessionStyledLine {
+        text: plain_line.to_string(),
+        style: SingleSessionLineStyle::Assistant,
+    }];
+    let plain_segments = single_session_styled_text_segments(&plain_lines);
+    assert!(
+        plain_segments.contains(&(
+            plain_line,
+            Attrs::new()
+                .family(Family::Name(SINGLE_SESSION_ASSISTANT_FONT_FAMILY))
+                .color(single_session_line_color(SingleSessionLineStyle::Assistant))
+        ))
+    );
+}
+
+#[test]
 fn glyphon_body_buffer_uses_line_style_colors() {
-    let mut app = SingleSessionApp::new(None);
+    let mut app = SingleSessionApp::new(Some(test_session_card(
+        "session_colors",
+        "colors",
+        "active",
+    )));
     app.messages.push(SingleSessionMessage::user("question"));
     app.messages.push(SingleSessionMessage::assistant(
         "answer\n\n```rust\nfn main() {}\n```",
@@ -869,11 +1360,11 @@ fn glyphon_body_buffer_uses_line_style_colors() {
         Some(single_session_line_color(SingleSessionLineStyle::Assistant))
     );
     assert_eq!(
-        first_glyph_color_for_text(body, "``` rust"),
+        first_glyph_color_for_text(body, "  rust"),
         Some(single_session_line_color(SingleSessionLineStyle::Code))
     );
     assert_eq!(
-        first_glyph_color_for_text(body, "• bash done"),
+        first_glyph_color_for_text(body, "  bash done"),
         Some(single_session_line_color(SingleSessionLineStyle::Tool))
     );
     assert_eq!(
@@ -898,15 +1389,15 @@ fn single_session_transcript_card_runs_group_card_styles() {
         .iter()
         .find(|run| run.style == SingleSessionLineStyle::Code)
         .expect("code block should have a card run");
-    assert_eq!(code.line_count, 3);
-    assert_eq!(lines[code.line].text, "``` rust");
+    assert_eq!(code.line_count, 2);
+    assert_eq!(lines[code.line].text, "  rust");
 
-    let tool = runs
-        .iter()
-        .find(|run| run.style == SingleSessionLineStyle::Tool)
-        .expect("tool line should have a card run");
-    assert_eq!(tool.line_count, 1);
-    assert_eq!(lines[tool.line].text, "• bash done");
+    // Tool rows are neutral inline transcript rows, not orange card runs.
+    assert!(
+        runs.iter()
+            .all(|run| run.style != SingleSessionLineStyle::Tool)
+    );
+    assert!(lines.iter().any(|line| line.text == "  bash done"));
 
     let error = runs
         .iter()
@@ -928,12 +1419,18 @@ fn single_session_vertices_include_transcript_card_backgrounds() {
     let vertices = build_single_session_vertices(&app, PhysicalSize::new(1000, 720), 0.0, 0);
 
     assert!(vertices_have_color(&vertices, CODE_BLOCK_BACKGROUND_COLOR));
-    assert!(vertices_have_color(&vertices, TOOL_CARD_BACKGROUND_COLOR));
     assert!(vertices_have_color(&vertices, ERROR_CARD_BACKGROUND_COLOR));
 }
 
 fn vertices_have_color(vertices: &[Vertex], color: [f32; 4]) -> bool {
     vertices.iter().any(|vertex| vertex.color == color)
+}
+
+fn vertices_with_color_count(vertices: &[Vertex], color: [f32; 4]) -> usize {
+    vertices
+        .iter()
+        .filter(|vertex| vertex.color == color)
+        .count()
 }
 
 fn positions_for_color(vertices: &[Vertex], color: [f32; 4]) -> Vec<[u32; 2]> {
@@ -956,6 +1453,13 @@ fn assert_visual_text_contains(key: &SingleSessionTextKey, expected: &str) {
     assert!(
         body.contains(expected),
         "expected visual body to contain {expected:?}, got:\n{body}"
+    );
+}
+
+fn assert_is_handwritten_welcome_phrase(phrase: &str) {
+    assert!(
+        HANDWRITTEN_WELCOME_PHRASES.contains(&phrase),
+        "unexpected handwritten welcome phrase: {phrase:?}"
     );
 }
 
@@ -985,9 +1489,15 @@ fn first_glyph_color_for_text(buffer: &Buffer, text: &str) -> Option<TextColor> 
 }
 
 #[test]
-fn single_session_tool_events_create_transcript_cards() {
+fn single_session_tool_events_expand_context_and_collapse_previous_call() {
     let mut app = SingleSessionApp::new(None);
     app.apply_session_event(session_launch::DesktopSessionEvent::ToolStarted {
+        name: "bash".to_string(),
+    });
+    app.apply_session_event(session_launch::DesktopSessionEvent::ToolInput {
+        delta: r#"{"command":"cargo test -p jcode-desktop","timeout":120000,"intent":"Run desktop tests"}"#.to_string(),
+    });
+    app.apply_session_event(session_launch::DesktopSessionEvent::ToolExecuting {
         name: "bash".to_string(),
     });
     app.apply_session_event(session_launch::DesktopSessionEvent::ToolFinished {
@@ -997,9 +1507,53 @@ fn single_session_tool_events_create_transcript_cards() {
     });
 
     let body = app.body_lines().join("\n");
-    assert!(body.contains("• bash running"));
-    assert!(body.contains("• bash done: tests passed"));
+    assert!(body.contains("  ✓ bash · done · tests passed"));
+    assert!(body.contains("intent: Run desktop tests"));
+    assert!(body.contains("$ cargo test -p jcode-desktop"));
+    assert!(!body.contains("    timeout: 120000"));
     assert_eq!(app.status.as_deref(), Some("tool bash done"));
+
+    app.apply_session_event(session_launch::DesktopSessionEvent::ToolStarted {
+        name: "read".to_string(),
+    });
+    let body = app.body_lines().join("\n");
+    assert!(body.contains("  ✓ bash · done · tests passed"));
+    assert!(!body.contains("Run desktop tests"));
+    assert!(body.contains("  ○ read · preparing"));
+}
+
+#[test]
+fn single_session_adjacent_tool_messages_render_as_compact_summary() {
+    let mut app = SingleSessionApp::new(None);
+    app.messages
+        .push(SingleSessionMessage::tool("▸ read done: 100 chars"));
+    app.messages
+        .push(SingleSessionMessage::tool("▸ agentgrep done: 10 matches"));
+    app.messages
+        .push(SingleSessionMessage::tool("▸ agentgrep done: 11 matches"));
+    app.messages.push(SingleSessionMessage::tool("▸ edit done"));
+
+    let body = app.body_lines();
+    assert_eq!(body.len(), 1);
+    assert_eq!(
+        body[0],
+        "  ▸ tools: 1 read, 2 agentgrep, 1 edit · ~23 tokens"
+    );
+}
+
+#[test]
+fn single_session_tool_summary_resets_at_non_tool_messages() {
+    let mut app = SingleSessionApp::new(None);
+    app.messages
+        .push(SingleSessionMessage::tool("▸ read done: 100 chars"));
+    app.messages.push(SingleSessionMessage::assistant("ok"));
+    app.messages.push(SingleSessionMessage::tool("▸ edit done"));
+
+    let body = app.body_lines().join("\n");
+    assert!(body.contains("  ✓ read · done · 100 chars"));
+    assert!(body.contains("ok"));
+    assert!(body.contains("  ✓ edit · done"));
+    assert!(!body.contains("tools:"));
 }
 
 #[test]
@@ -1009,7 +1563,11 @@ fn single_session_hotkey_help_toggles_discoverable_shortcuts() {
 
     assert_eq!(app.handle_key(KeyInput::HotkeyHelp), KeyOutcome::Redraw);
     assert!(app.show_help);
-    let help = app.body_lines();
+    let help = app
+        .inline_widget_styled_lines()
+        .into_iter()
+        .map(|line| line.text)
+        .collect::<Vec<_>>();
     assert!(help.iter().any(|line| line == "desktop shortcuts"));
     assert!(help_has_shortcut(
         &help,
@@ -1034,9 +1592,11 @@ fn single_session_hotkey_help_toggles_discoverable_shortcuts() {
     let help_text = help.join("\n");
     assert!(!help_text.contains("desktop queue follow-up pending"));
     assert!(!help_text.contains("1  question"));
+    assert!(app.body_lines().join("\n").contains("1  question"));
 
     assert_eq!(app.handle_key(KeyInput::Escape), KeyOutcome::Redraw);
     assert!(!app.show_help);
+    assert!(app.inline_widget_styled_lines().is_empty());
     assert_eq!(app.handle_key(KeyInput::Escape), KeyOutcome::None);
     assert!(app.body_lines().join("\n").contains("1  question"));
 }
@@ -1087,6 +1647,9 @@ fn single_session_model_cycle_updates_status_and_transcript() {
 #[test]
 fn single_session_model_picker_loads_filters_and_selects_model() {
     let mut app = SingleSessionApp::new(None);
+    app.messages.push(SingleSessionMessage::assistant(
+        "existing transcript stays visible",
+    ));
 
     assert_eq!(
         app.handle_key(KeyInput::OpenModelPicker),
@@ -1094,7 +1657,11 @@ fn single_session_model_picker_loads_filters_and_selects_model() {
     );
     assert!(app.model_picker.open);
     assert!(app.model_picker.loading);
-    assert!(app.body_lines().join("\n").contains("loading models"));
+    assert!(
+        app.inline_widget_styled_lines()
+            .into_iter()
+            .any(|line| line.text.contains("loading models"))
+    );
 
     app.apply_session_event(session_launch::DesktopSessionEvent::ModelCatalog {
         current_model: Some("claude-sonnet-4-5".to_string()),
@@ -1103,36 +1670,55 @@ fn single_session_model_picker_loads_filters_and_selects_model() {
             session_launch::DesktopModelChoice {
                 model: "claude-sonnet-4-5".to_string(),
                 provider: Some("claude".to_string()),
+                api_method: Some("oauth".to_string()),
                 detail: Some("active account".to_string()),
                 available: true,
             },
             session_launch::DesktopModelChoice {
                 model: "claude-opus-4-5".to_string(),
                 provider: Some("claude".to_string()),
+                api_method: Some("oauth".to_string()),
                 detail: Some("premium".to_string()),
                 available: true,
             },
         ],
     });
 
-    let picker = app.body_lines().join("\n");
-    assert!(picker.contains("desktop model/account picker"));
-    assert!(picker.contains("current: Claude · claude-sonnet-4-5"));
+    let body = app.body_lines().join("\n");
+    assert!(body.contains("existing transcript stays visible"));
+    assert!(!body.contains("MODEL"));
+    let picker = app
+        .inline_widget_styled_lines()
+        .into_iter()
+        .map(|line| line.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(picker.contains("╭─ model picker · current Claude · claude-sonnet-4-5"));
+    assert!(picker.contains("MODEL"));
+    assert!(picker.contains("PROVIDER"));
+    assert!(picker.contains("METHOD"));
     assert!(picker.contains("✓ claude-sonnet-4-5"));
-    assert!(picker.contains("provider claude"));
+    assert!(picker.contains("claude"));
+    assert!(picker.contains("oauth"));
 
     assert_eq!(
         app.handle_key(KeyInput::Character("opus".to_string())),
         KeyOutcome::Redraw
     );
-    let filtered = app.body_lines().join("\n");
-    assert!(filtered.contains("filter: opus"));
+    let filtered = app
+        .inline_widget_styled_lines()
+        .into_iter()
+        .map(|line| line.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(filtered.contains("\"opus\""));
     assert!(filtered.contains("claude-opus-4-5"));
 
     assert_eq!(
         app.handle_key(KeyInput::SubmitDraft),
         KeyOutcome::SetModel("claude-opus-4-5".to_string())
     );
+    assert!(!app.model_picker.open);
 }
 
 #[test]
@@ -1187,6 +1773,34 @@ fn single_session_session_switcher_loads_filters_and_resumes_session() {
 }
 
 #[test]
+fn desktop_resume_args_are_parsed() {
+    assert_eq!(
+        desktop_resume_session_id_from_args(["jcode-desktop", "--resume", "session_beta"]),
+        Some("session_beta".to_string())
+    );
+    assert_eq!(
+        desktop_resume_session_id_from_args(["jcode-desktop", "--resume=session_gamma"]),
+        Some("session_gamma".to_string())
+    );
+    assert_eq!(desktop_resume_session_id_from_args(["jcode-desktop"]), None);
+}
+
+#[test]
+fn initial_single_session_app_marks_resume_visible_before_interaction() {
+    let DesktopApp::SingleSession(app) = initial_single_session_app(Some("session_missing")) else {
+        panic!("expected single session app");
+    };
+
+    assert_eq!(app.live_session_id.as_deref(), Some("session_missing"));
+    assert!(
+        !app.body_lines()
+            .join("\n")
+            .contains("What are we building today")
+    );
+    assert!(app.body_lines().join("\n").contains("resumed session"));
+}
+
+#[test]
 fn single_session_session_switcher_marks_current_session_and_reloads() {
     let alpha = test_session_card("session_alpha", "alpha", "active");
     let beta = test_session_card("session_beta", "beta", "idle");
@@ -1223,9 +1837,12 @@ fn single_session_model_picker_updates_current_model_after_switch() {
     assert_eq!(app.model_picker.current_model.as_deref(), Some("gpt-5.4"));
     assert_eq!(app.model_picker.provider_name.as_deref(), Some("OpenAI"));
     assert!(
-        app.body_lines()
+        app.inline_widget_styled_lines()
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
             .join("\n")
-            .contains("current: OpenAI · gpt-5.4")
+            .contains("╭─ model picker · current OpenAI · gpt-5.4")
     );
     assert!(app.composer_status_line().contains("model OpenAI/gpt-5.4"));
 }
@@ -1350,6 +1967,484 @@ fn single_session_ctrl_enter_queues_while_processing_then_dequeues() {
     assert!(app.is_processing);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueTraceAction {
+    TypeA,
+    TypeB,
+    CtrlEnter,
+    Reloading,
+    Reloaded,
+    SessionStarted,
+    TextDelta,
+    Done,
+    Error,
+    TryDrainQueued,
+}
+
+#[derive(Default, Debug)]
+struct QueueReferenceModel {
+    draft: String,
+    processing: bool,
+    reloading: bool,
+    error: bool,
+    queued: Vec<String>,
+    sent: Vec<String>,
+}
+
+impl QueueReferenceModel {
+    fn apply(&mut self, action: QueueTraceAction) -> Option<String> {
+        match action {
+            QueueTraceAction::TypeA => self.draft.push('a'),
+            QueueTraceAction::TypeB => self.draft.push('b'),
+            QueueTraceAction::CtrlEnter => {
+                let message = self.draft.trim().to_string();
+                if message.is_empty() {
+                    return None;
+                }
+                self.draft.clear();
+                if self.processing {
+                    self.queued.push(message);
+                } else {
+                    self.processing = true;
+                    self.error = false;
+                    self.sent.push(message.clone());
+                    return Some(message);
+                }
+            }
+            QueueTraceAction::Reloading => {
+                // A hot reload is not a turn end. Wait-til-turn-end prompts must stay queued.
+                self.processing = true;
+                self.reloading = true;
+            }
+            QueueTraceAction::Reloaded => {
+                self.processing = true;
+                self.reloading = false;
+            }
+            QueueTraceAction::SessionStarted => {
+                // Reconnection/session-start is also not a turn end.
+            }
+            QueueTraceAction::TextDelta => self.reloading = false,
+            QueueTraceAction::Done => {
+                if self.reloading {
+                    // A terminal event racing with reload is stale unless the reconnected turn has
+                    // produced activity again.
+                    self.processing = true;
+                } else {
+                    self.processing = false;
+                }
+            }
+            QueueTraceAction::Error => {
+                self.processing = false;
+                self.reloading = false;
+                self.error = true;
+            }
+            QueueTraceAction::TryDrainQueued => {
+                if !self.processing && !self.error && !self.queued.is_empty() {
+                    let message = self.queued.remove(0);
+                    self.processing = true;
+                    self.error = false;
+                    self.sent.push(message.clone());
+                    return Some(message);
+                }
+            }
+        }
+        None
+    }
+}
+
+fn apply_queue_trace_action_to_app(
+    app: &mut SingleSessionApp,
+    action: QueueTraceAction,
+) -> Option<String> {
+    match action {
+        QueueTraceAction::TypeA => {
+            app.handle_key(KeyInput::Character("a".to_string()));
+            None
+        }
+        QueueTraceAction::TypeB => {
+            app.handle_key(KeyInput::Character("b".to_string()));
+            None
+        }
+        QueueTraceAction::CtrlEnter => match app.handle_key(KeyInput::QueueDraft) {
+            KeyOutcome::StartFreshSession { message, .. }
+            | KeyOutcome::SendDraft { message, .. } => Some(message),
+            KeyOutcome::Redraw | KeyOutcome::None => None,
+            other => panic!("unexpected Ctrl+Enter outcome in queue trace: {other:?}"),
+        },
+        QueueTraceAction::Reloading => {
+            app.apply_session_event(session_launch::DesktopSessionEvent::Reloading {
+                new_socket: Some("/tmp/jcode-reload-model-test.sock".to_string()),
+            });
+            None
+        }
+        QueueTraceAction::Reloaded => {
+            app.apply_session_event(session_launch::DesktopSessionEvent::Reloaded {
+                session_id: "reload-model-session".to_string(),
+            });
+            None
+        }
+        QueueTraceAction::SessionStarted => {
+            app.apply_session_event(session_launch::DesktopSessionEvent::SessionStarted {
+                session_id: "reload-model-session".to_string(),
+            });
+            None
+        }
+        QueueTraceAction::TextDelta => {
+            app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
+                "post reload activity".to_string(),
+            ));
+            None
+        }
+        QueueTraceAction::Done => {
+            app.apply_session_event(session_launch::DesktopSessionEvent::Done);
+            None
+        }
+        QueueTraceAction::Error => {
+            app.apply_session_event(session_launch::DesktopSessionEvent::Error(
+                "reload failed".to_string(),
+            ));
+            None
+        }
+        QueueTraceAction::TryDrainQueued => app
+            .take_next_queued_draft()
+            .map(|(message, _images)| message),
+    }
+}
+
+fn assert_queue_trace_state(
+    app: &SingleSessionApp,
+    model: &QueueReferenceModel,
+    real_sent: &[String],
+    trace: &[QueueTraceAction],
+) {
+    assert_eq!(app.draft, model.draft, "draft mismatch for trace {trace:?}");
+    assert_eq!(
+        app.is_processing, model.processing,
+        "processing mismatch for trace {trace:?}"
+    );
+    assert_eq!(
+        app.queued_draft_count(),
+        model.queued.len(),
+        "queued draft count mismatch for trace {trace:?}"
+    );
+    assert_eq!(
+        app.queued_draft_messages(),
+        model.queued,
+        "queued draft mismatch for trace {trace:?}"
+    );
+    assert_eq!(real_sent, model.sent, "sent mismatch for trace {trace:?}");
+    assert_eq!(
+        app.error.is_some(),
+        model.error,
+        "error mismatch for trace {trace:?}"
+    );
+
+    let status = app.composer_status_line();
+    if model.queued.is_empty() {
+        assert!(
+            !status.contains(" queued"),
+            "status should not show queued count for trace {trace:?}: {status}"
+        );
+    } else {
+        assert!(
+            status.contains(&format!("{} queued", model.queued.len())),
+            "status should show queued count for trace {trace:?}: {status}"
+        );
+    }
+
+    let body = app.body_lines().join("\n");
+    for queued in &model.queued {
+        assert!(
+            body.contains(&format!("queued prompt: {queued}")),
+            "body should show queued prompt {queued:?} for trace {trace:?}: {body}"
+        );
+    }
+}
+
+fn run_queue_trace(trace: &[QueueTraceAction]) {
+    let mut app = SingleSessionApp::new(None);
+    let mut model = QueueReferenceModel::default();
+    let mut real_sent = Vec::new();
+    let mut prefix = Vec::new();
+
+    for &action in trace {
+        prefix.push(action);
+        let expected_send = model.apply(action);
+        let actual_send = apply_queue_trace_action_to_app(&mut app, action);
+        assert_eq!(
+            actual_send, expected_send,
+            "send outcome mismatch after trace prefix {prefix:?}"
+        );
+        if let Some(message) = actual_send {
+            real_sent.push(message);
+        }
+        if action == QueueTraceAction::Reloading {
+            assert!(
+                app.composer_status_line()
+                    .contains("server reloading, reconnecting"),
+                "reload step should be visible in status for trace {prefix:?}: {}",
+                app.composer_status_line()
+            );
+        }
+        assert_queue_trace_state(&app, &model, &real_sent, &prefix);
+    }
+}
+
+fn apply_session_event_batch_then_auto_drain(
+    app: &mut DesktopApp,
+    events: Vec<session_launch::DesktopSessionEvent>,
+) -> Option<String> {
+    let stats = apply_desktop_session_event_batch_with_stats(app, events);
+    if !stats.visible_changed {
+        return None;
+    }
+    app.take_next_queued_single_session_draft()
+        .map(|(message, _images)| message)
+}
+
+#[test]
+fn single_session_event_loop_auto_drain_ignores_stale_done_after_reload() {
+    let mut desktop = DesktopApp::SingleSession(SingleSessionApp::new(None));
+    let DesktopApp::SingleSession(app) = &mut desktop else {
+        unreachable!();
+    };
+    app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
+        "working".to_string(),
+    ));
+    app.is_processing = true;
+    app.handle_key(KeyInput::Character("next".to_string()));
+    assert_eq!(app.handle_key(KeyInput::QueueDraft), KeyOutcome::Redraw);
+
+    let drained = apply_session_event_batch_then_auto_drain(
+        &mut desktop,
+        vec![
+            session_launch::DesktopSessionEvent::Reloading {
+                new_socket: Some("/tmp/jcode-reload-event-loop-test.sock".to_string()),
+            },
+            session_launch::DesktopSessionEvent::Done,
+        ],
+    );
+
+    assert_eq!(
+        drained, None,
+        "stale Done after reload must not auto-drain queued prompt"
+    );
+    let DesktopApp::SingleSession(app) = &desktop else {
+        unreachable!();
+    };
+    assert_eq!(app.queued_draft_messages(), vec!["next".to_string()]);
+    assert!(app.composer_status_line().contains("1 queued"));
+    assert!(app.is_processing);
+}
+
+#[test]
+fn single_session_event_loop_auto_drain_after_post_reload_activity_done() {
+    let mut desktop = DesktopApp::SingleSession(SingleSessionApp::new(None));
+    let DesktopApp::SingleSession(app) = &mut desktop else {
+        unreachable!();
+    };
+    app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
+        "working".to_string(),
+    ));
+    app.is_processing = true;
+    app.handle_key(KeyInput::Character("next".to_string()));
+    assert_eq!(app.handle_key(KeyInput::QueueDraft), KeyOutcome::Redraw);
+
+    let drained = apply_session_event_batch_then_auto_drain(
+        &mut desktop,
+        vec![
+            session_launch::DesktopSessionEvent::Reloading {
+                new_socket: Some("/tmp/jcode-reload-event-loop-test.sock".to_string()),
+            },
+            session_launch::DesktopSessionEvent::Reloaded {
+                session_id: "reload-model-session".to_string(),
+            },
+            session_launch::DesktopSessionEvent::TextDelta("resumed".to_string()),
+            session_launch::DesktopSessionEvent::Done,
+        ],
+    );
+
+    assert_eq!(drained, Some("next".to_string()));
+    let DesktopApp::SingleSession(app) = &desktop else {
+        unreachable!();
+    };
+    assert!(app.queued_draft_messages().is_empty());
+    assert!(
+        app.is_processing,
+        "draining queued prompt starts the next turn"
+    );
+}
+
+#[test]
+fn single_session_event_loop_auto_drain_allows_done_after_reloaded_without_output() {
+    let mut desktop = DesktopApp::SingleSession(SingleSessionApp::new(None));
+    let DesktopApp::SingleSession(app) = &mut desktop else {
+        unreachable!();
+    };
+    app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
+        "working".to_string(),
+    ));
+    app.is_processing = true;
+    app.handle_key(KeyInput::Character("next".to_string()));
+    assert_eq!(app.handle_key(KeyInput::QueueDraft), KeyOutcome::Redraw);
+
+    let drained = apply_session_event_batch_then_auto_drain(
+        &mut desktop,
+        vec![
+            session_launch::DesktopSessionEvent::Reloading {
+                new_socket: Some("/tmp/jcode-reload-event-loop-test.sock".to_string()),
+            },
+            session_launch::DesktopSessionEvent::Reloaded {
+                session_id: "reload-model-session".to_string(),
+            },
+            session_launch::DesktopSessionEvent::Done,
+        ],
+    );
+
+    assert_eq!(drained, Some("next".to_string()));
+}
+
+#[test]
+fn single_session_event_loop_reload_error_keeps_queue_retryable() {
+    let mut desktop = DesktopApp::SingleSession(SingleSessionApp::new(None));
+    let DesktopApp::SingleSession(app) = &mut desktop else {
+        unreachable!();
+    };
+    app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
+        "working".to_string(),
+    ));
+    app.is_processing = true;
+    app.handle_key(KeyInput::Character("retry me".to_string()));
+    assert_eq!(app.handle_key(KeyInput::QueueDraft), KeyOutcome::Redraw);
+
+    let drained = apply_session_event_batch_then_auto_drain(
+        &mut desktop,
+        vec![
+            session_launch::DesktopSessionEvent::Reloading {
+                new_socket: Some("/tmp/jcode-reload-event-loop-test.sock".to_string()),
+            },
+            session_launch::DesktopSessionEvent::Error("reload failed".to_string()),
+        ],
+    );
+
+    assert_eq!(drained, None);
+    let DesktopApp::SingleSession(app) = &desktop else {
+        unreachable!();
+    };
+    assert_eq!(app.queued_draft_messages(), vec!["retry me".to_string()]);
+    assert!(app.composer_status_line().contains("error"));
+    assert!(app.composer_status_line().contains("1 queued"));
+}
+
+#[test]
+fn single_session_event_loop_multiple_reloads_preserve_queued_prompt_order() {
+    let mut desktop = DesktopApp::SingleSession(SingleSessionApp::new(None));
+    let DesktopApp::SingleSession(app) = &mut desktop else {
+        unreachable!();
+    };
+    app.is_processing = true;
+    app.handle_key(KeyInput::Character("first".to_string()));
+    assert_eq!(app.handle_key(KeyInput::QueueDraft), KeyOutcome::Redraw);
+
+    assert_eq!(
+        apply_session_event_batch_then_auto_drain(
+            &mut desktop,
+            vec![
+                session_launch::DesktopSessionEvent::Reloading {
+                    new_socket: Some("/tmp/jcode-reload-one.sock".to_string()),
+                },
+                session_launch::DesktopSessionEvent::Reloaded {
+                    session_id: "reload-model-session".to_string(),
+                },
+            ],
+        ),
+        None
+    );
+
+    let DesktopApp::SingleSession(app) = &mut desktop else {
+        unreachable!();
+    };
+    app.handle_key(KeyInput::Character("second".to_string()));
+    assert_eq!(app.handle_key(KeyInput::QueueDraft), KeyOutcome::Redraw);
+    assert_eq!(
+        app.queued_draft_messages(),
+        vec!["first".to_string(), "second".to_string()]
+    );
+
+    assert_eq!(
+        apply_session_event_batch_then_auto_drain(
+            &mut desktop,
+            vec![
+                session_launch::DesktopSessionEvent::Reloading {
+                    new_socket: Some("/tmp/jcode-reload-two.sock".to_string()),
+                },
+                session_launch::DesktopSessionEvent::Reloaded {
+                    session_id: "reload-model-session".to_string(),
+                },
+                session_launch::DesktopSessionEvent::Done,
+            ],
+        ),
+        Some("first".to_string())
+    );
+    assert_eq!(
+        apply_session_event_batch_then_auto_drain(
+            &mut desktop,
+            vec![session_launch::DesktopSessionEvent::Done],
+        ),
+        Some("second".to_string())
+    );
+}
+
+#[test]
+fn single_session_reload_queue_golden_trace_waits_for_done_before_drain() {
+    run_queue_trace(&[
+        QueueTraceAction::Reloading,
+        QueueTraceAction::TypeA,
+        QueueTraceAction::CtrlEnter,
+        QueueTraceAction::SessionStarted,
+        QueueTraceAction::TryDrainQueued,
+        QueueTraceAction::Done,
+        QueueTraceAction::TryDrainQueued,
+        QueueTraceAction::Reloaded,
+        QueueTraceAction::Done,
+        QueueTraceAction::TryDrainQueued,
+        QueueTraceAction::TextDelta,
+        QueueTraceAction::Done,
+        QueueTraceAction::TryDrainQueued,
+    ]);
+}
+
+#[test]
+fn single_session_reload_queue_state_space_matches_reference_model() {
+    const ACTIONS: &[QueueTraceAction] = &[
+        QueueTraceAction::TypeA,
+        QueueTraceAction::TypeB,
+        QueueTraceAction::CtrlEnter,
+        QueueTraceAction::Reloading,
+        QueueTraceAction::Reloaded,
+        QueueTraceAction::SessionStarted,
+        QueueTraceAction::TextDelta,
+        QueueTraceAction::Done,
+        QueueTraceAction::Error,
+        QueueTraceAction::TryDrainQueued,
+    ];
+
+    fn visit(trace: &mut Vec<QueueTraceAction>, depth_remaining: usize) {
+        run_queue_trace(trace);
+        if depth_remaining == 0 {
+            return;
+        }
+        for &action in ACTIONS {
+            trace.push(action);
+            visit(trace, depth_remaining - 1);
+            trace.pop();
+        }
+    }
+
+    let mut trace = Vec::new();
+    visit(&mut trace, 5);
+}
+
 #[test]
 fn single_session_paste_text_preserves_spaces() {
     let mut app = SingleSessionApp::new(None);
@@ -1358,11 +2453,72 @@ fn single_session_paste_text_preserves_spaces() {
 }
 
 #[test]
+fn clipboard_text_normalization_preserves_whitespace_but_unifies_newlines() {
+    assert_eq!(normalize_clipboard_text("a\r\nb\rc  "), "a\nb\nc  ");
+    assert_eq!(
+        normalize_clipboard_text("  padded\ttext  "),
+        "  padded\ttext  "
+    );
+}
+
+#[test]
+fn paste_clipboard_text_inserts_at_cursor_and_supports_undo() {
+    let mut desktop = DesktopApp::SingleSession(SingleSessionApp::new(None));
+    let DesktopApp::SingleSession(app) = &mut desktop else {
+        unreachable!();
+    };
+    app.handle_key(KeyInput::Character("hello world".to_string()));
+    app.draft_cursor = "hello".len();
+
+    assert!(paste_clipboard_text(&mut desktop, "\r\n  pasted  "));
+    let DesktopApp::SingleSession(app) = &mut desktop else {
+        unreachable!();
+    };
+    assert_eq!(app.draft, "hello\n  pasted   world");
+    assert_eq!(app.draft_cursor, "hello\n  pasted  ".len());
+
+    assert_eq!(app.handle_key(KeyInput::UndoInput), KeyOutcome::Redraw);
+    assert_eq!(app.draft, "hello world");
+    assert_eq!(app.draft_cursor, "hello".len());
+}
+
+#[test]
+fn paste_clipboard_text_routes_to_interactive_stdin_response() {
+    let mut desktop = DesktopApp::SingleSession(SingleSessionApp::new(None));
+    let DesktopApp::SingleSession(app) = &mut desktop else {
+        unreachable!();
+    };
+    app.apply_session_event(session_launch::DesktopSessionEvent::StdinRequest {
+        request_id: "stdin-1".to_string(),
+        prompt: "Password:".to_string(),
+        is_password: true,
+        tool_call_id: "tool-1".to_string(),
+    });
+
+    assert!(paste_clipboard_text(&mut desktop, "secret\r\nline"));
+    let DesktopApp::SingleSession(app) = &desktop else {
+        unreachable!();
+    };
+    assert_eq!(app.stdin_response.as_ref().unwrap().input, "secret\nline");
+    assert!(app.draft.is_empty());
+}
+
+#[test]
+fn paste_clipboard_text_ignores_empty_text_so_image_fallback_can_run() {
+    let mut desktop = DesktopApp::SingleSession(SingleSessionApp::new(None));
+    assert!(!paste_clipboard_text(&mut desktop, ""));
+    let DesktopApp::SingleSession(app) = &desktop else {
+        unreachable!();
+    };
+    assert!(app.draft.is_empty());
+}
+
+#[test]
 fn single_session_character_selection_extracts_visible_text() {
     let mut app = SingleSessionApp::new(None);
     app.messages.push(SingleSessionMessage::user("first"));
     app.messages
-        .push(SingleSessionMessage::assistant("second\nthird"));
+        .push(SingleSessionMessage::assistant("second  \nthird"));
     let lines = app.body_lines();
     let second_line = lines
         .iter()
@@ -1460,6 +2616,40 @@ fn single_session_body_point_at_position_maps_x_to_character_column() {
 }
 
 #[test]
+fn single_session_draft_point_at_position_maps_to_cursor_line_column() {
+    let size = PhysicalSize::new(900, 700);
+    let mut app = SingleSessionApp::new(None);
+    app.handle_key(KeyInput::Character("hello\nworld".to_string()));
+    let typography = single_session_typography_for_scale(app.text_scale());
+    let char_width = typography.code_size * 0.58;
+    let line_height = typography.code_size * typography.code_line_height;
+    let draft_top = single_session_draft_top_for_app(&app, size);
+    let prompt_columns = app.composer_prompt().chars().count() as f32;
+
+    assert_eq!(
+        single_session_draft_line_col_at_position(
+            &app,
+            size,
+            PANEL_TITLE_LEFT_PADDING + (prompt_columns + 2.0) * char_width,
+            draft_top + line_height * 0.5,
+        ),
+        Some((0, 2))
+    );
+    assert_eq!(
+        single_session_draft_line_col_at_position(
+            &app,
+            size,
+            PANEL_TITLE_LEFT_PADDING + 3.0 * char_width,
+            draft_top + line_height * 1.5,
+        ),
+        Some((1, 3))
+    );
+
+    app.set_draft_cursor_line_col(1, 3);
+    assert_eq!(app.draft_cursor, "hello\nwor".len());
+}
+
+#[test]
 fn single_session_prompt_jump_moves_between_user_turns() {
     let mut app = SingleSessionApp::new(None);
     for index in 0..4 {
@@ -1469,13 +2659,13 @@ fn single_session_prompt_jump_moves_between_user_turns() {
             .push(SingleSessionMessage::assistant(format!("answer {index}")));
     }
 
-    assert_eq!(app.body_scroll_lines, 0);
+    assert_eq!(app.body_scroll_lines, 0.0);
     assert_eq!(app.handle_key(KeyInput::JumpPrompt(-1)), KeyOutcome::Redraw);
-    assert!(app.body_scroll_lines > 0);
+    assert!(app.body_scroll_lines > 0.0);
     let older_scroll = app.body_scroll_lines;
 
     assert_eq!(app.handle_key(KeyInput::JumpPrompt(1)), KeyOutcome::Redraw);
-    assert!(app.body_scroll_lines < older_scroll || app.body_scroll_lines == 0);
+    assert!(app.body_scroll_lines < older_scroll || app.body_scroll_lines == 0.0);
 }
 
 #[test]
@@ -1503,12 +2693,12 @@ fn single_session_streaming_preserves_manual_scroll_but_submit_follows_bottom() 
     app.messages.push(SingleSessionMessage::user("older"));
     app.messages
         .push(SingleSessionMessage::assistant("older answer"));
-    app.scroll_body_lines(12);
+    app.scroll_body_lines(12.0);
 
     app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
         "new token".to_string(),
     ));
-    assert_eq!(app.body_scroll_lines, 12);
+    assert_eq!(app.body_scroll_lines, 12.0);
 
     app.handle_key(KeyInput::Character("new prompt".to_string()));
     assert_eq!(
@@ -1518,7 +2708,7 @@ fn single_session_streaming_preserves_manual_scroll_but_submit_follows_bottom() 
             images: Vec::new()
         }
     );
-    assert_eq!(app.body_scroll_lines, 0);
+    assert_eq!(app.body_scroll_lines, 0.0);
 }
 
 #[test]
@@ -1687,7 +2877,7 @@ fn single_session_scrollback_virtualizes_visible_body_lines() {
     assert!(bottom.contains("message 31"));
     assert!(!bottom.contains("message 0"));
 
-    app.scroll_body_lines(24);
+    app.scroll_body_lines(24.0);
     let older = single_session_visible_body(&app, size).join("\n");
     assert!(older.contains("message 0") || older.contains("message 1"));
 }
@@ -1696,16 +2886,16 @@ fn single_session_scrollback_virtualizes_visible_body_lines() {
 fn mouse_scroll_delta_maps_to_body_scroll_lines() {
     assert_eq!(
         mouse_scroll_lines(MouseScrollDelta::LineDelta(0.0, 1.0)),
-        Some(3)
+        Some(3.0)
     );
     assert_eq!(
         mouse_scroll_lines(MouseScrollDelta::LineDelta(0.0, -1.0)),
-        Some(-3)
+        Some(-3.0)
     );
 }
 
 #[test]
-fn pixel_scroll_deltas_accumulate_fractional_lines() {
+fn pixel_scroll_deltas_preserve_fractional_lines() {
     let mut accumulator = ScrollLineAccumulator::default();
     let now = Instant::now();
     let half_line = body_scroll_line_pixels() as f64 * 0.5;
@@ -1715,19 +2905,43 @@ fn pixel_scroll_deltas_accumulate_fractional_lines() {
             MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, half_line)),
             now,
         ),
-        None
+        Some(0.5)
     );
     assert_eq!(
         accumulator.scroll_lines(
             MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, half_line)),
             now + Duration::from_millis(16),
         ),
-        Some(1)
+        Some(0.5)
     );
 }
 
 #[test]
-fn pixel_scroll_reversal_and_idle_reset_drop_stale_fraction() {
+fn scroll_accumulator_keeps_fractional_momentum_after_wheel_input() {
+    let mut accumulator = ScrollLineAccumulator::default();
+    let now = Instant::now();
+
+    assert_eq!(
+        accumulator.scroll_lines(MouseScrollDelta::LineDelta(0.0, 1.0), now),
+        Some(3.0)
+    );
+    assert!(accumulator.is_active());
+
+    let frame = accumulator.frame(now + Duration::from_millis(16));
+    assert!(
+        frame.active,
+        "momentum should continue after the input event"
+    );
+    assert!(
+        frame
+            .scroll_lines
+            .is_some_and(|lines| lines.abs() >= SCROLL_FRACTIONAL_EPSILON),
+        "momentum should emit fractional scroll lines"
+    );
+}
+
+#[test]
+fn pixel_scroll_reversal_and_idle_reset_keep_fractional_deltas() {
     let mut accumulator = ScrollLineAccumulator::default();
     let now = Instant::now();
     let three_quarters = body_scroll_line_pixels() as f64 * 0.75;
@@ -1738,21 +2952,21 @@ fn pixel_scroll_reversal_and_idle_reset_drop_stale_fraction() {
             MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, three_quarters)),
             now,
         ),
-        None
+        Some(0.75)
     );
     assert_eq!(
         accumulator.scroll_lines(
             MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, -half_line)),
             now + Duration::from_millis(16),
         ),
-        None
+        Some(-0.5)
     );
     assert_eq!(
         accumulator.scroll_lines(
             MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, -half_line)),
             now + Duration::from_millis(32),
         ),
-        Some(-1)
+        Some(-0.5)
     );
 
     assert_eq!(
@@ -1760,14 +2974,14 @@ fn pixel_scroll_reversal_and_idle_reset_drop_stale_fraction() {
             MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, three_quarters)),
             now + Duration::from_millis(48),
         ),
-        None
+        Some(0.75)
     );
     assert_eq!(
         accumulator.scroll_lines(
             MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, three_quarters)),
             now + SCROLL_GESTURE_IDLE_RESET + Duration::from_millis(80),
         ),
-        None
+        Some(0.75)
     );
 }
 
@@ -1780,25 +2994,26 @@ fn mouse_scroll_clamps_to_available_single_session_history() {
             .push(SingleSessionMessage::assistant(format!("message {index}")));
     }
     let mut desktop = DesktopApp::SingleSession(app);
+    let mut metrics_cache = SingleSessionScrollMetricsCache::default();
 
-    assert!(desktop.scroll_single_session_body(10_000, size));
+    assert!(desktop.scroll_single_session_body(10_000.0, size, &mut metrics_cache));
     let DesktopApp::SingleSession(app) = &desktop else {
         unreachable!();
     };
     let max_scroll = single_session_body_scroll_metrics(app, size, 0)
         .expect("scroll metrics")
         .max_scroll_lines;
-    assert_eq!(app.body_scroll_lines, max_scroll);
+    assert_eq!(app.body_scroll_lines, max_scroll as f32);
 
-    assert!(desktop.scroll_single_session_body(-1, size));
+    assert!(desktop.scroll_single_session_body(-1.0, size, &mut metrics_cache));
     let DesktopApp::SingleSession(app) = &desktop else {
         unreachable!();
     };
-    assert_eq!(app.body_scroll_lines, max_scroll - 1);
+    assert_eq!(app.body_scroll_lines, max_scroll as f32 - 1.0);
 }
 
 #[test]
-fn smooth_scroll_viewport_keeps_fractional_line_offset() {
+fn fractional_scroll_viewport_keeps_fractional_line_offset() {
     let mut app = SingleSessionApp::new(None);
     let size = PhysicalSize::new(900, 360);
     for index in 0..48 {
@@ -1807,31 +3022,108 @@ fn smooth_scroll_viewport_keeps_fractional_line_offset() {
     }
 
     let normal = single_session_body_viewport_for_tick(&app, size, 0, 0.0);
-    let smooth = single_session_body_viewport_for_tick(&app, size, 0, 0.5);
+    app.scroll_body_lines(0.5);
+    let fractional = single_session_body_viewport_for_tick(&app, size, 0, 0.0);
 
-    assert!(smooth.top_offset_pixels < 0.0);
-    assert_eq!(smooth.lines.len(), normal.lines.len() + 1);
-    assert_eq!(&smooth.lines[1..], normal.lines.as_slice());
+    assert!(fractional.top_offset_pixels < 0.0);
+    assert_eq!(fractional.lines.len(), normal.lines.len() + 1);
+    assert_eq!(&fractional.lines[1..], normal.lines.as_slice());
 }
 
 #[test]
-fn smooth_scroll_offsets_body_text_area_without_moving_chrome() {
-    let mut app = SingleSessionApp::new(None);
+fn fractional_scroll_offsets_body_text_area_without_moving_chrome() {
+    let mut app = SingleSessionApp::new(Some(test_session_card(
+        "session_smooth",
+        "smooth",
+        "active",
+    )));
     let size = PhysicalSize::new(900, 360);
     for index in 0..48 {
         app.messages
             .push(SingleSessionMessage::assistant(format!("message {index}")));
     }
+    let mut fractional_app = app.clone();
+    fractional_app.scroll_body_lines(0.5);
     let mut font_system = FontSystem::new();
-    let key = single_session_text_key_for_tick_with_scroll(&app, size, 0, 0.5);
+    let key = single_session_text_key(&fractional_app, size);
     let buffers = single_session_text_buffers_from_key(&key, size, &mut font_system);
     let normal_areas = single_session_text_areas_for_app_with_scroll(&app, &buffers, size, 0, 0.0);
-    let smooth_areas = single_session_text_areas_for_app_with_scroll(&app, &buffers, size, 0, 0.5);
+    let fractional_areas =
+        single_session_text_areas_for_app_with_scroll(&fractional_app, &buffers, size, 0, 0.0);
 
-    assert_eq!(normal_areas[0].top, PANEL_TITLE_TOP_PADDING);
-    assert_eq!(smooth_areas[0].top, PANEL_TITLE_TOP_PADDING);
-    assert_eq!(normal_areas[2].top, PANEL_BODY_TOP_PADDING);
-    assert!(smooth_areas[2].top < normal_areas[2].top);
+    let normal_body = normal_areas
+        .iter()
+        .find(|area| area.bounds.top == PANEL_BODY_TOP_PADDING as i32)
+        .expect("normal body text area");
+    let fractional_body = fractional_areas
+        .iter()
+        .find(|area| area.bounds.top == PANEL_BODY_TOP_PADDING as i32)
+        .expect("fractional body text area");
+    let normal_title = normal_areas
+        .iter()
+        .find(|area| area.top == PANEL_TITLE_TOP_PADDING && area.bounds.bottom == 64)
+        .expect("normal title text area");
+    let fractional_title = fractional_areas
+        .iter()
+        .find(|area| area.top == PANEL_TITLE_TOP_PADDING && area.bounds.bottom == 64)
+        .expect("fractional title text area");
+
+    assert_eq!(normal_title.top, PANEL_TITLE_TOP_PADDING);
+    assert_eq!(fractional_title.top, PANEL_TITLE_TOP_PADDING);
+    assert_eq!(normal_body.top, PANEL_BODY_TOP_PADDING);
+    assert!(fractional_body.top < normal_body.top);
+}
+
+#[test]
+fn welcome_timeline_body_reserves_composer_lane_clearance() {
+    let size = PhysicalSize::new(900, 640);
+    let mut app = SingleSessionApp::new(None);
+    app.handle_key(KeyInput::Character("hello desktop".to_string()));
+    assert!(matches!(
+        app.handle_key(KeyInput::SubmitDraft),
+        KeyOutcome::StartFreshSession { .. }
+    ));
+    app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
+        "assistant response".to_string(),
+    ));
+
+    let mut font_system = FontSystem::new();
+    let buffers = single_session_text_buffers(&app, size, &mut font_system);
+    let areas = single_session_text_areas_for_app(&app, &buffers, size);
+    let typography = single_session_typography();
+    let line_height = typography.body_size * typography.body_line_height;
+    let status_lane = areas.first().expect("status lane text area");
+    let body_area = areas
+        .iter()
+        .find(|area| area.bounds.top == PANEL_BODY_TOP_PADDING as i32)
+        .expect("welcome timeline body text area");
+    let body_bottom = body_area.bounds.bottom as f32;
+    let composer_top = status_lane.top;
+
+    assert!(
+        composer_top - body_bottom >= line_height - 1.0,
+        "body text should reserve at least one transcript line before composer/status lane: body_bottom={body_bottom}, composer_top={composer_top}, line_height={line_height}"
+    );
+}
+
+#[test]
+fn single_session_visible_body_wraps_long_assistant_lines() {
+    let mut app = SingleSessionApp::new(Some(test_session_card("session_wrap", "wrap", "active")));
+    app.messages.push(SingleSessionMessage::assistant(
+        "This assistant response should wrap cleanly within the desktop transcript column instead of running horizontally forever."
+    ));
+    let size = PhysicalSize::new(360, 480);
+
+    let raw = app.body_styled_lines();
+    let visible = single_session_visible_body(&app, size);
+
+    assert_eq!(raw.len(), 1, "model transcript remains one logical line");
+    assert!(
+        visible.len() > raw.len(),
+        "rendered body should split long assistant text into visual lines: {:?}",
+        visible
+    );
+    assert!(visible.iter().all(|line| line.chars().count() <= 40));
 }
 
 #[test]
@@ -1871,7 +3163,7 @@ fn glyphon_caret_position_uses_shaped_draft_buffer() {
 }
 
 #[test]
-fn fresh_welcome_uses_stable_composer_while_drafting() {
+fn fresh_welcome_uses_dominant_hero_composer_while_drafting() {
     let size = PhysicalSize::new(1000, 720);
     let mut app = SingleSessionApp::new(None);
     let mut font_system = FontSystem::new();
@@ -1879,28 +3171,112 @@ fn fresh_welcome_uses_stable_composer_while_drafting() {
     let areas = single_session_text_areas_for_app(&app, &buffers, size);
 
     assert_eq!(
-        areas.last().expect("draft text area").top,
-        single_session_draft_top(size)
+        areas.first().expect("draft text area").top,
+        fresh_welcome_draft_top(size)
     );
-    assert_eq!(
-        areas.len(),
-        5,
-        "fresh welcome uses normal session text areas"
+    assert_eq!(areas.len(), 5, "fresh welcome hides normal status chrome");
+    assert!(
+        areas.first().expect("draft text area").top > handwritten_welcome_bounds(size).1[1],
+        "fresh input line should stay visually below the handwritten hero"
+    );
+    let hero_bottom = handwritten_welcome_bounds(size).1[1];
+    let version_area = areas
+        .iter()
+        .find(|area| area.top > hero_bottom && area.top < fresh_welcome_draft_top(size))
+        .expect("version label should sit between hero and composer");
+    assert!(
+        version_area.top - hero_bottom >= 29.0,
+        "version label needs enough clearance from handwriting strokes"
     );
 
     app.handle_key(KeyInput::Character("hello".to_string()));
     let key = single_session_text_key(&app, size);
     assert!(app.is_fresh_welcome_visible());
-    assert_visual_text_contains(&key, "Hello there");
-    assert!(key.welcome_hero.is_empty());
+    assert_is_handwritten_welcome_phrase(&key.welcome_hero);
+    assert_visual_text_contains(&key, &key.welcome_hero);
     assert_eq!(
         single_session_draft_top_for_app(&app, size),
-        single_session_draft_top(size)
+        fresh_welcome_draft_top(size)
     );
 }
 
 #[test]
-fn fresh_submit_keeps_stable_layout_and_greeting_in_history() {
+fn completed_welcome_hero_hands_off_to_clean_font_overlay() {
+    let size = PhysicalSize::new(1000, 720);
+    let app = SingleSessionApp::new(None);
+    let mut font_system = FontSystem::new();
+    let buffers = single_session_text_buffers(&app, size, &mut font_system);
+
+    let completed_vertices =
+        build_single_session_vertices_with_scroll_and_reveal(&app, size, 0.0, 0, 0.0, 1.0);
+    let completed_areas = single_session_text_areas_for_app(&app, &buffers, size);
+
+    assert!(!vertices_have_color(
+        &completed_vertices,
+        WELCOME_HANDWRITING_COLOR
+    ));
+    assert!(
+        completed_areas
+            .iter()
+            .any(|area| std::ptr::eq(area.buffer, &buffers[6])),
+        "completed reveal should hand off from vector handwriting to the clean shaped text overlay"
+    );
+}
+
+#[test]
+fn fresh_welcome_model_picker_only_reserves_inline_lane() {
+    let size = PhysicalSize::new(1000, 720);
+    let mut app = SingleSessionApp::new(None);
+
+    assert_eq!(
+        app.handle_key(KeyInput::Character("/model opus".to_string())),
+        KeyOutcome::LoadModelCatalog
+    );
+
+    let key = single_session_text_key(&app, size);
+    assert!(
+        key.fresh_welcome_visible,
+        "inline model picker should not hide the welcome hero"
+    );
+    assert_is_handwritten_welcome_phrase(&key.welcome_hero);
+    assert_visual_text_contains(&key, &key.welcome_hero);
+    assert!(
+        key.body.is_empty(),
+        "model picker status should not become transcript/body text"
+    );
+    assert!(
+        key.inline_widget
+            .iter()
+            .any(|line| line.text.contains("MODEL"))
+    );
+    assert_eq!(
+        single_session_draft_top_for_app(&app, size),
+        single_session_draft_top(size),
+        "inline picker should move the composer to the normal bottom input lane"
+    );
+
+    let mut font_system = FontSystem::new();
+    let buffers = single_session_text_buffers(&app, size, &mut font_system);
+    let areas = single_session_text_areas_for_app(&app, &buffers, size);
+    let draft_area = areas.first().expect("draft text area");
+    assert_eq!(draft_area.top, single_session_draft_top(size));
+    let inline_area = areas.last().expect("inline model picker text area");
+    assert!(
+        inline_area.top < draft_area.top,
+        "fresh inline picker should render above the typed /model command"
+    );
+    assert!(
+        inline_area.top > handwritten_welcome_bounds(size).1[1],
+        "fresh inline picker must not overlap the handwritten welcome hero"
+    );
+    assert!(
+        inline_area.bounds.bottom > inline_area.bounds.top,
+        "fresh inline picker should keep a visible clipped lane"
+    );
+}
+
+#[test]
+fn fresh_submit_keeps_single_visual_timeline_without_transcript_greeting() {
     let size = PhysicalSize::new(1000, 720);
     let mut app = SingleSessionApp::new(None);
     app.handle_key(KeyInput::Character("hello desktop".to_string()));
@@ -1917,21 +3293,53 @@ fn fresh_submit_keeps_stable_layout_and_greeting_in_history() {
     push_single_session_caret(&mut vertices, &app, size, buffers.get(2));
 
     assert_eq!(key.title, "");
+    assert_is_handwritten_welcome_phrase(&key.welcome_hero);
     assert!(key.status.contains("sending"));
-    assert_visual_text_contains(&key, "Hello there");
+    assert!(key.status.contains("Esc interrupt"));
+    assert_visual_text_contains(&key, &key.welcome_hero);
+    assert!(vertices_have_color(&vertices, WELCOME_AURORA_BLUE));
+    assert!(vertices_have_color(&vertices, WELCOME_HANDWRITING_COLOR));
+    assert!(vertices_have_color(&vertices, NATIVE_SPINNER_HEAD_COLOR));
     assert!(
         key.body
             .iter()
             .any(|line| line.text.contains("hello desktop"))
     );
-    assert_eq!(
-        areas.len(),
-        5,
-        "submit should keep normal session text areas"
+    let submitted_index = key
+        .body
+        .iter()
+        .position(|line| line.text.contains("hello desktop"))
+        .expect("submitted prompt should remain visible in the timeline");
+    assert!(
+        submitted_index > 0
+            && key.body[..submitted_index]
+                .iter()
+                .all(|line| line.text.trim().is_empty()),
+        "visual hero spacer should stay before submitted input in the timeline body"
     );
-    assert_eq!(areas[4].top, single_session_draft_top(size));
+    assert!(
+        key.body.iter().all(|line| !HANDWRITTEN_WELCOME_PHRASES
+            .iter()
+            .any(|phrase| line.text.contains(phrase))),
+        "welcome hero must stay visual-only, not become a transcript line"
+    );
+    assert!(
+        areas.len() >= 4,
+        "submit should keep welcome timeline chrome instead of switching screens"
+    );
+    let status_lane = areas.first().expect("status lane should prepare first");
+    let body_area = areas
+        .iter()
+        .find(|area| area.bounds.top == PANEL_BODY_TOP_PADDING as i32)
+        .expect("welcome body text area");
+    assert_eq!(body_area.top, PANEL_BODY_TOP_PADDING);
+    assert!(status_lane.top > body_area.top);
+    assert!(status_lane.top >= fresh_welcome_draft_top(size));
     assert!(!vertices_have_color(&vertices, [0.060, 0.085, 0.145, 0.34]));
-    assert!(vertices_have_color(&vertices, SINGLE_SESSION_CARET_COLOR));
+    assert!(
+        !vertices_have_color(&vertices, SINGLE_SESSION_CARET_COLOR),
+        "empty post-submit composer lane should become status, not a blank caret"
+    );
 }
 
 #[test]
@@ -1961,14 +3369,20 @@ fn session_attach_does_not_move_submitted_fresh_layout() {
     let after_buffers = single_session_text_buffers_from_key(&after_key, size, &mut font_system);
     let after_areas = single_session_text_areas_for_app(&app, &after_buffers, size);
 
-    assert_visual_text_contains(&after_key, "Hello there");
+    assert_visual_text_contains(&after_key, &after_key.welcome_hero);
     assert_visual_text_contains(&after_key, "hello desktop");
-    assert_eq!(before_areas[2].top, after_areas[2].top);
-    assert_eq!(before_areas[4].top, after_areas[4].top);
+    assert_eq!(
+        before_areas.first().unwrap().top,
+        after_areas.first().unwrap().top
+    );
+    assert_eq!(
+        before_areas.last().unwrap().top,
+        after_areas.last().unwrap().top
+    );
 }
 
 #[test]
-fn long_transcript_can_scroll_back_to_welcome_greeting() {
+fn long_transcript_keeps_welcome_visual_only() {
     let size = PhysicalSize::new(900, 360);
     let mut app = SingleSessionApp::new(None);
     for index in 0..48 {
@@ -1977,15 +3391,27 @@ fn long_transcript_can_scroll_back_to_welcome_greeting() {
     }
 
     let bottom = single_session_visible_body(&app, size).join("\n");
-    assert!(!bottom.contains("Hello there"));
+    assert!(
+        !HANDWRITTEN_WELCOME_PHRASES
+            .iter()
+            .any(|phrase| bottom.contains(phrase))
+    );
     assert!(bottom.contains("message 47"));
 
     let metrics = single_session_body_scroll_metrics(&app, size, 0).expect("scroll metrics");
     app.scroll_body_lines(metrics.max_scroll_lines as i32);
     let top = single_session_visible_body(&app, size).join("\n");
+    let key = single_session_text_key(&app, size);
+    let vertices = build_single_session_vertices(&app, size, 0.0, 0);
 
-    assert!(top.contains("Hello there"));
+    assert!(
+        !HANDWRITTEN_WELCOME_PHRASES
+            .iter()
+            .any(|phrase| top.contains(phrase))
+    );
     assert!(!top.contains("message 47"));
+    assert_is_handwritten_welcome_phrase(&key.welcome_hero);
+    assert!(vertices_have_color(&vertices, WELCOME_HANDWRITING_COLOR));
 }
 
 #[test]
@@ -2010,22 +3436,21 @@ fn single_session_without_session_is_native_fresh_draft() {
 }
 
 #[test]
-fn fresh_single_session_keeps_welcome_text_in_scrollable_body() {
+fn fresh_single_session_keeps_welcome_model_and_hero_available() {
     let app = SingleSessionApp::new(None);
     let first = single_session_text_key_for_tick(&app, PhysicalSize::new(900, 700), 0);
     let later = single_session_text_key_for_tick(&app, PhysicalSize::new(900, 700), 42);
+    let model_lines = app.body_styled_lines();
 
     assert!(
-        first
-            .body
-            .iter()
-            .any(|line| { line.text.contains("Hello there") || line.text.contains("Welcome, ") }),
-        "expected generic or named welcome in body, got: {:?}",
-        first.body
+        model_lines.is_empty(),
+        "fresh welcome greeting should be visual-only, not transcript body: {:?}",
+        model_lines
     );
-    assert!(first.welcome_hero.is_empty());
+    assert_eq!(first.welcome_hero, later.welcome_hero);
+    assert_is_handwritten_welcome_phrase(&first.welcome_hero);
+    assert!(first.body.is_empty());
     assert!(first.welcome_hint.is_empty());
-    assert_eq!(first.body[0].text, later.body[0].text);
 }
 
 #[test]
@@ -2176,4 +3601,99 @@ fn focused_panel_draft_only_shows_for_focused_insert_panel() {
         focused_panel_draft(&workspace, workspace.focused_id + 1),
         None
     );
+}
+
+#[test]
+fn streaming_response_line_count_matches_wrapped_tail_lines() {
+    let mut app = SingleSessionApp::new(None);
+    app.messages
+        .push(SingleSessionMessage::assistant("finished response"));
+    app.streaming_response = format!(
+        "short line\n{}\nwrapped words {}",
+        "x".repeat(512),
+        "word ".repeat(96)
+    );
+    let size = PhysicalSize::new(640, 800);
+
+    let mut rendered_lines = Vec::new();
+    append_single_session_streaming_response_rendered_body_lines(&app, size, &mut rendered_lines);
+
+    assert_eq!(
+        single_session_streaming_response_rendered_body_line_count(&app, size),
+        rendered_lines.len()
+    );
+}
+
+#[test]
+fn rendered_body_cache_key_samples_large_transcript_middle() {
+    let mut first = SingleSessionApp::new(None);
+    first.messages = (0..64)
+        .map(|index| SingleSessionMessage::assistant(format!("assistant message {index:02}")))
+        .collect();
+    let mut second = first.clone();
+    second.messages[34] = SingleSessionMessage::assistant("assistant message XX");
+    let size = (1280, 800);
+
+    assert_ne!(
+        first.rendered_body_cache_key(size),
+        second.rendered_body_cache_key(size)
+    );
+    assert_ne!(
+        first.rendered_body_static_cache_key(size),
+        second.rendered_body_static_cache_key(size)
+    );
+}
+
+#[test]
+fn streaming_text_delta_batches_do_not_refresh_session_metadata() {
+    let mut app = DesktopApp::SingleSession(SingleSessionApp::new(None));
+    app.apply_session_event(session_launch::DesktopSessionEvent::SessionStarted {
+        session_id: "session_live".to_string(),
+    });
+
+    let stats = apply_desktop_session_event_batch_with_stats(
+        &mut app,
+        vec![session_launch::DesktopSessionEvent::TextDelta(
+            "streaming chunk".to_string(),
+        )],
+    );
+
+    assert!(stats.visible_changed);
+    assert_eq!(stats.text_delta_bytes, "streaming chunk".len());
+    assert!(!stats.session_card_refresh_requested);
+}
+
+#[test]
+fn terminal_session_events_request_async_session_metadata_refresh() {
+    let mut app = DesktopApp::SingleSession(SingleSessionApp::new(None));
+    app.apply_session_event(session_launch::DesktopSessionEvent::SessionStarted {
+        session_id: "session_live".to_string(),
+    });
+
+    let stats = apply_desktop_session_event_batch_with_stats(
+        &mut app,
+        vec![session_launch::DesktopSessionEvent::Done],
+    );
+
+    assert!(stats.visible_changed);
+    assert!(stats.session_card_refresh_requested);
+}
+
+#[test]
+fn desktop_preferences_save_is_queued_off_ui_thread() {
+    let workspace = Workspace::from_session_cards(vec![workspace::SessionCard {
+        session_id: "session_pref".to_string(),
+        title: "pref".to_string(),
+        subtitle: "active".to_string(),
+        detail: "1 msg".to_string(),
+        preview_lines: Vec::new(),
+        detail_lines: Vec::new(),
+    }]);
+    let expected = workspace.preferences();
+    let (tx, rx) = mpsc::channel();
+
+    queue_desktop_preferences_save(&workspace, &Some(tx));
+
+    assert_eq!(rx.try_recv().ok(), Some(expected));
+    assert!(rx.try_recv().is_err());
 }

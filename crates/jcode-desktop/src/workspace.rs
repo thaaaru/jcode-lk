@@ -87,6 +87,8 @@ pub enum KeyInput {
     OpenSessionSwitcher,
     ModelPickerMove(i32),
     CycleModel(i8),
+    #[allow(dead_code)]
+    CycleReasoningEffort(i8),
     AttachClipboardImage,
     ClearAttachedImages,
     PasteText,
@@ -95,7 +97,10 @@ pub enum KeyInput {
     SubmitDraft,
     SpawnPanel,
     HotkeyHelp,
+    ToggleSessionInfo,
     RefreshSessions,
+    AdjustTextScale(i8),
+    ResetTextScale,
     SetPanelSize(PanelSizePreset),
     Character(String),
     Other,
@@ -124,6 +129,8 @@ pub enum KeyOutcome {
     RestoreCrashedSessions,
     SetModel(String),
     CycleModel(i8),
+    #[allow(dead_code)]
+    CycleReasoningEffort(i8),
     SendStdinResponse {
         request_id: String,
         input: String,
@@ -484,6 +491,7 @@ impl Workspace {
             | KeyInput::CycleModel(_)
             | KeyInput::OpenModelPicker
             | KeyInput::OpenSessionSwitcher
+            | KeyInput::ToggleSessionInfo
             | KeyInput::ModelPickerMove(_)
             | KeyInput::AttachClipboardImage
             | KeyInput::ClearAttachedImages
@@ -610,8 +618,12 @@ impl Workspace {
             | KeyInput::CopyLatestResponse
             | KeyInput::OpenModelPicker
             | KeyInput::OpenSessionSwitcher
+            | KeyInput::ToggleSessionInfo
             | KeyInput::ModelPickerMove(_)
-            | KeyInput::CycleModel(_) => KeyOutcome::None,
+            | KeyInput::CycleModel(_)
+            | KeyInput::CycleReasoningEffort(_)
+            | KeyInput::AdjustTextScale(_)
+            | KeyInput::ResetTextScale => KeyOutcome::None,
             KeyInput::RetrieveQueuedDraft => KeyOutcome::None,
             KeyInput::PasteText => KeyOutcome::PasteText,
             KeyInput::Character(text) => {

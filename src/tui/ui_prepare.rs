@@ -1,6 +1,5 @@
 use super::*;
 use crate::tui::ui::{self, WrappedLineMap};
-use std::hash::{Hash, Hasher};
 
 fn content_prefers_display_as_logical_lines(content: &str) -> bool {
     content.lines().any(|line| {

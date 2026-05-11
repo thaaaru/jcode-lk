@@ -134,6 +134,30 @@ pub(super) fn is_non_retryable_auto_poke_error(error: &str) -> bool {
     deterministic_markers
         .iter()
         .any(|marker| lower.contains(marker))
+        || is_auto_poke_connectivity_error(error)
+}
+
+pub(super) fn is_auto_poke_connectivity_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+
+    // Auto-poke cannot repair local/network/provider DNS or routing failures. Re-sending the same
+    // poke just creates noise until the user or network environment changes.
+    let connectivity_markers = [
+        "failed to send openai-compatible chat request",
+        "dns error",
+        "failed to lookup address information",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "no route to host",
+        "network is unreachable",
+        "host is unreachable",
+        "could not resolve host",
+        "couldn't resolve host",
+    ];
+
+    connectivity_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 pub(super) fn stop_auto_poke_for_non_retryable_error(app: &mut App, error: &str) -> bool {
@@ -1205,6 +1229,7 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
             )));
             return true;
         }
+        crate::tui::session_picker::invalidate_session_list_cache();
         app.trigger_save_memory_extraction();
         let name = app.session.display_name().to_string();
         let msg = if let Some(ref lbl) = app.session.save_label {
@@ -1232,6 +1257,7 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
             )));
             return true;
         }
+        crate::tui::session_picker::invalidate_session_list_cache();
         let name = app.session.display_name().to_string();
         app.push_display_message(DisplayMessage::system(format!(
             "Removed bookmark from session **{}**.",

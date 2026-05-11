@@ -2,7 +2,8 @@
 # Remote cargo runner (build/test/check/clippy) via SSH + rsync.
 #
 # Defaults:
-# - Host: must be provided via JCODE_REMOTE_HOST or --host
+# - Config file: ~/.config/jcode/remote-build.env (override with JCODE_REMOTE_CONFIG)
+# - Host: JCODE_REMOTE_HOST from env/config, or --host
 # - Remote dir: .cache/remote-builds/jcode/<repo-name> (override with JCODE_REMOTE_DIR or --remote-dir)
 #
 # Examples:
@@ -19,7 +20,7 @@ Usage: scripts/remote_build.sh [options] [cargo-subcommand] [cargo-args...]
 
 Options:
   -r, --release        Add --release to cargo invocation
-  --host HOST          Remote SSH host (default: $JCODE_REMOTE_HOST; required if unset)
+  --host HOST          Remote SSH host (default: $JCODE_REMOTE_HOST from env/config; required if unset)
   --remote-dir DIR     Remote project directory (default: $JCODE_REMOTE_DIR or .cache/remote-builds/jcode/<repo-name>)
   --no-sync            Skip rsync upload step
   --sync-back          Force sync-back of built binary after command
@@ -31,11 +32,17 @@ Behavior:
   - Sync-back defaults to ON for 'build', OFF for other subcommands
   - For build sync-back, copies target/{debug|release}/<artifact> from remote to local
     (artifact defaults to 'jcode', or '--bin <name>' when provided)
+  - Default config file is ~/.config/jcode/remote-build.env
 EOF
 }
 
 LOCAL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_NAME="$(basename "$LOCAL_DIR")"
+
+# shellcheck source=scripts/remote_config.sh
+source "$LOCAL_DIR/scripts/remote_config.sh"
+jcode_load_remote_config
+
 REMOTE="${JCODE_REMOTE_HOST:-}"
 REMOTE_DIR="${JCODE_REMOTE_DIR:-.cache/remote-builds/jcode/${REPO_NAME}}"
 SSH_BIN="${JCODE_REMOTE_SSH_BIN:-ssh}"
@@ -133,8 +140,24 @@ case "$SYNC_BACK_MODE" in
         ;;
 esac
 
-if [[ "$RELEASE" -eq 1 ]]; then
+profile_name=""
+for ((i=0; i<${#POSITIONAL[@]}; i++)); do
+    case "${POSITIONAL[$i]}" in
+        --profile)
+            if [[ $((i + 1)) -lt ${#POSITIONAL[@]} ]]; then
+                profile_name="${POSITIONAL[$((i + 1))]}"
+            fi
+            ;;
+        --profile=*)
+            profile_name="${POSITIONAL[$i]#--profile=}"
+            ;;
+    esac
+done
+
+if [[ "$RELEASE" -eq 1 || "$profile_name" == "release" ]]; then
     build_mode="release"
+elif [[ -n "$profile_name" && "$profile_name" != "dev" ]]; then
+    build_mode="$profile_name"
 else
     build_mode="debug"
 fi
@@ -155,10 +178,12 @@ local_git_hash=""
 local_git_date=""
 local_git_tag=""
 local_git_dirty="0"
+local_changelog_raw=""
 if command -v git >/dev/null 2>&1 && git -C "$LOCAL_DIR" rev-parse --git-dir >/dev/null 2>&1; then
     local_git_hash="$(git -C "$LOCAL_DIR" rev-parse --short HEAD 2>/dev/null || true)"
     local_git_date="$(git -C "$LOCAL_DIR" log -1 --format=%ci 2>/dev/null || true)"
     local_git_tag="$(git -C "$LOCAL_DIR" describe --tags --always 2>/dev/null || true)"
+    local_changelog_raw="$(git -C "$LOCAL_DIR" log -700 --format='%h|%ct|%D|%s' 2>/dev/null || true)"
     if [[ -n "$(git -C "$LOCAL_DIR" status --porcelain 2>/dev/null || true)" ]]; then
         local_git_dirty="1"
     fi
@@ -179,6 +204,14 @@ if [[ "$SYNC_SOURCE" -eq 1 ]]; then
         --exclude '.git/' \
         --exclude '*.log' \
         --exclude '.claude/' \
+        --exclude '.codex-socktest/' \
+        --exclude '.jcode/' \
+        --exclude '.tmp/' \
+        --exclude '.wrangler/' \
+        --exclude 'tmp/' \
+        --exclude 'node_modules/' \
+        --exclude 'assets/demos/' \
+        --exclude 'assets/readme/' \
         "$LOCAL_DIR/" "$REMOTE:$REMOTE_DIR/"
 
     metadata_file="$(mktemp)"
@@ -188,6 +221,7 @@ if [[ "$SYNC_SOURCE" -eq 1 ]]; then
         printf 'git_date=%s\n' "$local_git_date"
         printf 'git_tag=%s\n' "$local_git_tag"
         printf 'git_dirty=%s\n' "$local_git_dirty"
+        printf 'changelog_raw<<JCODE_CHANGELOG_EOF\n%s\nJCODE_CHANGELOG_EOF\n' "$local_changelog_raw"
     } > "$metadata_file"
     "$RSYNC_BIN" -avz "$metadata_file" "$REMOTE:$REMOTE_DIR/.jcode-build-meta"
 else

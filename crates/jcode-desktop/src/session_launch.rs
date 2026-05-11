@@ -15,6 +15,7 @@ const SERVER_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub struct DesktopModelChoice {
     pub model: String,
     pub provider: Option<String>,
+    pub api_method: Option<String>,
     pub detail: Option<String>,
     pub available: bool,
 }
@@ -29,6 +30,12 @@ pub enum DesktopSessionEvent {
     TextReplace(String),
     ToolStarted {
         name: String,
+    },
+    ToolExecuting {
+        name: String,
+    },
+    ToolInput {
+        delta: String,
     },
     ToolFinished {
         name: String,
@@ -56,6 +63,9 @@ pub enum DesktopSessionEvent {
     },
     Reloading {
         new_socket: Option<String>,
+    },
+    Reloaded {
+        session_id: String,
     },
     Done,
     Error(String),
@@ -193,6 +203,44 @@ pub fn spawn_cycle_model(
             }
         })
         .context("failed to spawn desktop model switch worker")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn spawn_cycle_reasoning_effort(
+    direction: i8,
+    target_session_id: Option<String>,
+    event_tx: DesktopSessionEventSender,
+) -> Result<()> {
+    std::thread::Builder::new()
+        .name("jcode-desktop-cycle-effort".to_string())
+        .spawn(move || {
+            if let Err(error) = cycle_reasoning_effort(
+                direction,
+                target_session_id.as_deref(),
+                Some(event_tx.clone()),
+            ) {
+                let _ = event_tx.send(DesktopSessionEvent::ModelCatalogError {
+                    error: format!("{error:#}"),
+                });
+            }
+        })
+        .context("failed to spawn desktop reasoning effort worker")?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn spawn_cycle_reasoning_effort(
+    _direction: i8,
+    _target_session_id: Option<String>,
+    event_tx: DesktopSessionEventSender,
+) -> Result<()> {
+    event_tx
+        .send(DesktopSessionEvent::ModelCatalogError {
+            error: "desktop reasoning effort switching is not implemented on this platform yet"
+                .to_string(),
+        })
+        .ok();
     Ok(())
 }
 
@@ -392,6 +440,73 @@ fn set_model(
 }
 
 #[cfg(unix)]
+fn cycle_reasoning_effort(
+    direction: i8,
+    target_session_id: Option<&str>,
+    event_tx: Option<DesktopSessionEventSender>,
+) -> Result<()> {
+    const EFFORTS: [&str; 5] = ["none", "low", "medium", "high", "xhigh"];
+
+    send_desktop_status(&event_tx, "switching reasoning effort");
+    ensure_server_running()?;
+    let stream = connect_server_with_retry(SERVER_START_TIMEOUT)?;
+    let mut writer = stream
+        .try_clone()
+        .context("failed to clone server socket writer")?;
+    let mut reader = BufReader::new(stream);
+    let mut next_request_id = 1_u64;
+    subscribe_and_establish_session(
+        &mut reader,
+        &mut writer,
+        &mut next_request_id,
+        target_session_id,
+        event_tx.as_ref(),
+    )?;
+
+    let history_request_id = next_request_id;
+    write_json_line(
+        &mut writer,
+        json!({
+            "type": "get_history",
+            "id": history_request_id,
+        }),
+    )?;
+    next_request_id += 1;
+    let current = read_history_reasoning_effort(
+        &mut reader,
+        SERVER_START_TIMEOUT,
+        event_tx.as_ref(),
+        history_request_id,
+    )?;
+    let current_index = current
+        .as_deref()
+        .and_then(|effort| EFFORTS.iter().position(|candidate| *candidate == effort))
+        .unwrap_or(EFFORTS.len() - 1);
+    let next_index = if direction > 0 {
+        (current_index + 1).min(EFFORTS.len() - 1)
+    } else {
+        current_index.saturating_sub(1)
+    };
+    let next_effort = EFFORTS[next_index];
+
+    let request_id = next_request_id;
+    write_json_line(
+        &mut writer,
+        json!({
+            "type": "set_reasoning_effort",
+            "id": request_id,
+            "effort": next_effort,
+        }),
+    )?;
+    read_reasoning_effort_changed(
+        &mut reader,
+        SERVER_START_TIMEOUT,
+        event_tx.as_ref(),
+        request_id,
+    )
+}
+
+#[cfg(unix)]
 fn run_server_session(
     target_session_id: Option<&str>,
     message: &str,
@@ -470,13 +585,19 @@ fn run_server_session(
         let subscribe_request_id = next_request_id;
         subscribe_to_server(&mut writer, subscribe_request_id, Some(&session_id))?;
         next_request_id += 1;
-        let _ = establish_session_id(
+        let reconnected_session_id = establish_session_id(
             &mut reader,
             &mut writer,
             &mut next_request_id,
             subscribe_request_id,
             event_tx.as_ref(),
         )?;
+        send_desktop_event(
+            &event_tx,
+            DesktopSessionEvent::Reloaded {
+                session_id: reconnected_session_id,
+            },
+        );
     }
     Ok(session_id)
 }
@@ -772,6 +893,113 @@ fn read_model_changed(
 }
 
 #[cfg(unix)]
+fn read_history_reasoning_effort(
+    reader: &mut BufReader<UnixStream>,
+    timeout: Duration,
+    event_tx: Option<&DesktopSessionEventSender>,
+    request_id: u64,
+) -> Result<Option<String>> {
+    reader
+        .get_ref()
+        .set_read_timeout(Some(SERVER_CONNECT_RETRY_DELAY))
+        .context("failed to configure server socket timeout")?;
+    let started = Instant::now();
+    let mut line = String::new();
+    while started.elapsed() < timeout {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => anyhow::bail!("jcode server disconnected before loading history"),
+            Ok(_) => {
+                let value: Value = serde_json::from_str(line.trim())
+                    .context("failed to parse jcode server event")?;
+                if value.get("type").and_then(Value::as_str) == Some("history")
+                    && value.get("id").and_then(Value::as_u64) == Some(request_id)
+                {
+                    return Ok(history_reasoning_effort_from_server_value(&value));
+                }
+                if let Some(event) = desktop_event_from_server_value(&value) {
+                    if !matches!(event, DesktopSessionEvent::Done) {
+                        send_desktop_event_ref(event_tx, event);
+                    }
+                }
+                if value.get("type").and_then(Value::as_str) == Some("error")
+                    && value.get("id").and_then(Value::as_u64) == Some(request_id)
+                {
+                    let message = value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown server error");
+                    anyhow::bail!("jcode server rejected history request: {message}");
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error).context("failed to read jcode server event"),
+        }
+    }
+
+    anyhow::bail!("timed out waiting for jcode server history")
+}
+
+#[cfg(unix)]
+fn read_reasoning_effort_changed(
+    reader: &mut BufReader<UnixStream>,
+    timeout: Duration,
+    event_tx: Option<&DesktopSessionEventSender>,
+    request_id: u64,
+) -> Result<()> {
+    reader
+        .get_ref()
+        .set_read_timeout(Some(SERVER_CONNECT_RETRY_DELAY))
+        .context("failed to configure server socket timeout")?;
+    let started = Instant::now();
+    let mut line = String::new();
+    while started.elapsed() < timeout {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => anyhow::bail!("jcode server disconnected before switching reasoning effort"),
+            Ok(_) => {
+                let value: Value = serde_json::from_str(line.trim())
+                    .context("failed to parse jcode server event")?;
+                if value.get("type").and_then(Value::as_str) == Some("reasoning_effort_changed")
+                    && value.get("id").and_then(Value::as_u64) == Some(request_id)
+                {
+                    if let Some(event) = desktop_event_from_server_value(&value) {
+                        send_desktop_event_ref(event_tx, event);
+                    }
+                    return Ok(());
+                }
+                if let Some(event) = desktop_event_from_server_value(&value) {
+                    if !matches!(event, DesktopSessionEvent::Done) {
+                        send_desktop_event_ref(event_tx, event);
+                    }
+                }
+                if value.get("type").and_then(Value::as_str) == Some("error")
+                    && value.get("id").and_then(Value::as_u64) == Some(request_id)
+                {
+                    let message = value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown server error");
+                    anyhow::bail!("jcode server rejected reasoning effort switch: {message}");
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error).context("failed to read jcode server event"),
+        }
+    }
+
+    anyhow::bail!("timed out waiting for jcode server reasoning effort switch")
+}
+
+#[cfg(unix)]
 fn read_model_catalog(
     reader: &mut BufReader<UnixStream>,
     timeout: Duration,
@@ -978,12 +1206,25 @@ fn desktop_event_from_server_value(value: &Value) -> Option<DesktopSessionEvent>
             .get("detail")
             .and_then(Value::as_str)
             .map(|detail| DesktopSessionEvent::Status(detail.to_string())),
-        "tool_start" | "tool_exec" => {
+        "tool_start" => {
             value
                 .get("name")
                 .and_then(Value::as_str)
                 .map(|name| DesktopSessionEvent::ToolStarted {
                     name: name.to_string(),
+                })
+        }
+        "tool_exec" => value.get("name").and_then(Value::as_str).map(|name| {
+            DesktopSessionEvent::ToolExecuting {
+                name: name.to_string(),
+            }
+        }),
+        "tool_input" => {
+            value
+                .get("delta")
+                .and_then(Value::as_str)
+                .map(|delta| DesktopSessionEvent::ToolInput {
+                    delta: delta.to_string(),
                 })
         }
         "tool_done" => value.get("name").and_then(Value::as_str).map(|name| {
@@ -1011,6 +1252,18 @@ fn desktop_event_from_server_value(value: &Value) -> Option<DesktopSessionEvent>
                     .map(ToOwned::to_owned),
             }
         }),
+        "reasoning_effort_changed" => {
+            let effort = value
+                .get("effort")
+                .and_then(Value::as_str)
+                .unwrap_or("unchanged");
+            let status = if let Some(error) = value.get("error").and_then(Value::as_str) {
+                format!("effort switch failed: {error}")
+            } else {
+                format!("effort: {effort}")
+            };
+            Some(DesktopSessionEvent::Status(status))
+        }
         "history" => model_catalog_event_from_server_value(value),
         "available_models_updated" => Some(DesktopSessionEvent::ModelCatalog {
             current_model: None,
@@ -1070,6 +1323,21 @@ fn model_catalog_event_from_server_value(value: &Value) -> Option<DesktopSession
     })
 }
 
+fn history_reasoning_effort_from_server_value(value: &Value) -> Option<String> {
+    value
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("openai_reasoning_effort").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .get("provider_config")
+                .and_then(|config| config.get("openai_reasoning_effort"))
+                .and_then(Value::as_str)
+        })
+        .filter(|effort| !effort.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn model_choices_from_server_value(value: &Value) -> Vec<DesktopModelChoice> {
     let mut choices = Vec::new();
     if let Some(routes) = value
@@ -1086,6 +1354,11 @@ fn model_choices_from_server_value(value: &Value) -> Vec<DesktopModelChoice> {
                     .get("provider")
                     .and_then(Value::as_str)
                     .filter(|provider| !provider.is_empty())
+                    .map(ToOwned::to_owned),
+                api_method: route
+                    .get("api_method")
+                    .and_then(Value::as_str)
+                    .filter(|method| !method.is_empty())
                     .map(ToOwned::to_owned),
                 detail: route
                     .get("detail")
@@ -1107,6 +1380,7 @@ fn model_choices_from_server_value(value: &Value) -> Vec<DesktopModelChoice> {
             choices.push(DesktopModelChoice {
                 model: model.to_string(),
                 provider: None,
+                api_method: None,
                 detail: None,
                 available: true,
             });
@@ -1290,6 +1564,9 @@ mod tests {
     #[cfg(unix)]
     use std::sync::Mutex;
 
+    #[cfg(unix)]
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn validates_safe_session_ids() -> Result<()> {
         validate_resume_session_id("session_cow_123-abc.def")?;
@@ -1317,8 +1594,22 @@ mod tests {
             Some(DesktopSessionEvent::Done)
         );
         assert_eq!(
-            desktop_event_from_server_value(&json!({"type": "tool_exec", "name": "bash"})),
+            desktop_event_from_server_value(&json!({"type": "tool_start", "name": "bash"})),
             Some(DesktopSessionEvent::ToolStarted {
+                name: "bash".to_string()
+            })
+        );
+        assert_eq!(
+            desktop_event_from_server_value(
+                &json!({"type": "tool_input", "delta": "{\"command\":"})
+            ),
+            Some(DesktopSessionEvent::ToolInput {
+                delta: "{\"command\":".to_string()
+            })
+        );
+        assert_eq!(
+            desktop_event_from_server_value(&json!({"type": "tool_exec", "name": "bash"})),
+            Some(DesktopSessionEvent::ToolExecuting {
                 name: "bash".to_string()
             })
         );
@@ -1379,6 +1670,7 @@ mod tests {
                 models: vec![DesktopModelChoice {
                     model: "claude-sonnet-4-5".to_string(),
                     provider: Some("claude".to_string()),
+                    api_method: Some("responses".to_string()),
                     detail: Some("active account".to_string()),
                     available: true,
                 }]
@@ -1432,7 +1724,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn desktop_worker_roundtrips_message_with_fake_server() -> Result<()> {
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
         let socket_path = std::env::temp_dir().join(format!(
             "jcode-desktop-worker-smoke-{}-{}.sock",
@@ -1483,6 +1774,78 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn desktop_worker_emits_reloaded_before_real_done_after_fake_reload() -> Result<()> {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_path = std::env::temp_dir().join(format!(
+            "jcode-desktop-worker-reload-old-{}-{nonce}.sock",
+            std::process::id(),
+        ));
+        let new_socket_path = std::env::temp_dir().join(format!(
+            "jcode-desktop-worker-reload-new-{}-{nonce}.sock",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&new_socket_path);
+        let listener = UnixListener::bind(&socket_path)?;
+        let new_listener = UnixListener::bind(&new_socket_path)?;
+        let previous_socket = std::env::var_os("JCODE_SOCKET");
+        unsafe {
+            std::env::set_var("JCODE_SOCKET", &socket_path);
+        }
+
+        let server = std::thread::spawn(move || {
+            fake_desktop_server_reload_roundtrip(listener, new_listener, new_socket_path)
+        });
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_command_tx, command_rx) = mpsc::channel();
+
+        let result =
+            run_server_session(None, "hello reload", Vec::new(), Some(event_tx), command_rx);
+
+        restore_env_var("JCODE_SOCKET", previous_socket);
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert_eq!(result?, "session_desktop_reload_fake");
+        let requests = server.join().unwrap()?;
+        assert_eq!(requests[0]["type"], "subscribe");
+        assert_eq!(requests[1]["type"], "state");
+        assert_eq!(requests[2]["type"], "message");
+        assert_eq!(requests[3]["type"], "subscribe");
+        assert_eq!(
+            requests[3]["target_session_id"],
+            "session_desktop_reload_fake"
+        );
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        let reload_index = events
+            .iter()
+            .position(|event| matches!(event, DesktopSessionEvent::Reloading { .. }))
+            .expect("worker should forward reload event");
+        let reloaded_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    DesktopSessionEvent::Reloaded { session_id }
+                        if session_id == "session_desktop_reload_fake"
+                )
+            })
+            .expect("worker should emit explicit reload completion");
+        let done_index = events
+            .iter()
+            .position(|event| matches!(event, DesktopSessionEvent::Done))
+            .expect("worker should forward real message Done after reconnect");
+        assert!(reload_index < reloaded_index);
+        assert!(reloaded_index < done_index);
+        Ok(())
+    }
+
+    #[cfg(unix)]
     fn fake_desktop_server_roundtrip(listener: UnixListener) -> Result<Vec<Value>> {
         let (mut reader, mut writer, subscribe) = accept_first_requesting_client(&listener)?;
         write_json_line(&mut writer, json!({"type": "ack", "id": subscribe["id"]}))?;
@@ -1509,6 +1872,59 @@ mod tests {
         )?;
         write_json_line(&mut writer, json!({"type": "done", "id": message["id"]}))?;
         Ok(vec![subscribe, state, message])
+    }
+
+    #[cfg(unix)]
+    fn fake_desktop_server_reload_roundtrip(
+        listener: UnixListener,
+        new_listener: UnixListener,
+        new_socket_path: PathBuf,
+    ) -> Result<Vec<Value>> {
+        let (mut reader, mut writer, subscribe) = accept_first_requesting_client(&listener)?;
+        write_json_line(&mut writer, json!({"type": "ack", "id": subscribe["id"]}))?;
+        write_json_line(&mut writer, json!({"type": "done", "id": subscribe["id"]}))?;
+
+        let state = read_fake_server_request(&mut reader)?;
+        write_json_line(
+            &mut writer,
+            json!({
+                "type": "state",
+                "id": state["id"],
+                "session_id": "session_desktop_reload_fake",
+                "message_count": 0,
+                "is_processing": false,
+            }),
+        )?;
+
+        let message = read_fake_server_request(&mut reader)?;
+        write_json_line(&mut writer, json!({"type": "ack", "id": message["id"]}))?;
+        write_json_line(
+            &mut writer,
+            json!({"type": "reloading", "new_socket": new_socket_path.display().to_string()}),
+        )?;
+        // This terminal event belongs to the socket generation that just announced reload.
+        // The worker should leave that stream immediately and must not forward it.
+        let _ = write_json_line(&mut writer, json!({"type": "done", "id": message["id"]}));
+        drop(writer);
+        drop(reader);
+
+        let (new_reader, mut new_writer, reconnect_subscribe) =
+            accept_first_requesting_client(&new_listener)?;
+        write_json_line(
+            &mut new_writer,
+            json!({
+                "type": "session",
+                "session_id": "session_desktop_reload_fake",
+            }),
+        )?;
+        write_json_line(
+            &mut new_writer,
+            json!({"type": "done", "id": message["id"]}),
+        )?;
+        drop(new_reader);
+
+        let _ = std::fs::remove_file(new_socket_path);
+        Ok(vec![subscribe, state, message, reconnect_subscribe])
     }
 
     #[cfg(unix)]

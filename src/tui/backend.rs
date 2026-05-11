@@ -6,7 +6,7 @@
 //! Also provides debug socket events for exposing full TUI state.
 
 use crate::message::ToolCall;
-use crate::protocol::{FeatureToggle, Request, ServerEvent};
+use crate::protocol::{AuthChanged, FeatureToggle, Request, ServerEvent};
 use crate::server;
 use crate::transport::{Stream, WriteHalf};
 use crate::tui::remote_diff::RemoteDiffTracker;
@@ -511,13 +511,15 @@ impl RemoteConnection {
     }
 
     /// Set the active model on the server
-    pub async fn set_model(&mut self, model: &str) -> Result<()> {
+    pub async fn set_model(&mut self, model: &str) -> Result<u64> {
+        let id = self.next_request_id;
         let request = Request::SetModel {
-            id: self.next_request_id,
+            id,
             model: model.to_string(),
         };
         self.next_request_id += 1;
-        self.send_request(request).await
+        self.send_request(request).await?;
+        Ok(id)
     }
 
     /// Set or clear the session-scoped subagent model on the server.
@@ -735,14 +737,40 @@ impl RemoteConnection {
     pub async fn notify_auth_changed(&mut self) -> Result<()> {
         let id = self.next_request_id;
         self.next_request_id += 1;
-        self.send_request(Request::NotifyAuthChanged { id }).await
+        self.send_request(Request::NotifyAuthChanged {
+            id,
+            provider: None,
+            auth: None,
+        })
+        .await
     }
 
     /// Notify the server about auth changes without blocking the caller.
     pub fn notify_auth_changed_detached(&mut self) {
+        self.notify_auth_changed_for_provider_detached(None);
+    }
+
+    /// Notify the server about a provider-specific auth change without blocking the caller.
+    pub fn notify_auth_changed_for_provider_detached(&mut self, provider: Option<&str>) {
+        self.notify_auth_changed_detached_event(provider, None);
+    }
+
+    /// Notify the server about a typed auth lifecycle change without blocking the caller.
+    pub fn notify_auth_changed_detached_event(
+        &mut self,
+        provider: Option<&str>,
+        auth: Option<AuthChanged>,
+    ) {
         let id = self.next_request_id;
         self.next_request_id += 1;
-        self.send_request_detached(Request::NotifyAuthChanged { id }, "notify_auth_changed");
+        self.send_request_detached(
+            Request::NotifyAuthChanged {
+                id,
+                provider: provider.map(str::to_string),
+                auth,
+            },
+            "notify_auth_changed",
+        );
     }
 
     /// Ask server to switch active Anthropic account for this process/session.
@@ -1012,6 +1040,35 @@ mod tests {
             elapsed
         );
         assert_eq!(remote.next_request_id, 2);
+    }
+
+    #[tokio::test]
+    async fn detached_auth_changed_notification_sends_provider_hint() {
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote
+            ._dummy_peer
+            .take()
+            .expect("dummy remote should retain peer stream");
+        let (reader, _writer) = peer.into_split();
+        let mut reader = BufReader::new(reader);
+
+        remote.notify_auth_changed_for_provider_detached(Some("azure-openai"));
+
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+            .await
+            .expect("auth changed request should be sent before timeout")
+            .expect("auth changed request should be readable by peer");
+
+        assert_eq!(remote.next_request_id, 2);
+        assert!(matches!(
+            serde_json::from_str::<Request>(&line).expect("auth changed request should deserialize"),
+            Request::NotifyAuthChanged {
+                id: 1,
+                provider: Some(provider),
+                auth: None,
+            } if provider == "azure-openai"
+        ));
     }
 
     #[tokio::test]

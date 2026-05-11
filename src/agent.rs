@@ -31,13 +31,14 @@ use crate::message::{
     ContentBlock, Message, Role, StreamEvent, TOOL_OUTPUT_MISSING_TEXT, ToolCall, ToolDefinition,
 };
 use crate::protocol::{HistoryMessage, ServerEvent};
-use crate::provider::{NativeToolResult, Provider};
+use crate::provider::{NativeToolResult, Provider, ProviderRuntimeState};
 use crate::session::{GitState, Session, SessionStatus, StoredDisplayRole, StoredMessage};
 use crate::skill::SkillRegistry;
 use crate::tool::{Registry, ToolContext, ToolExecutionMode};
 use anyhow::Result;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
@@ -66,6 +67,54 @@ static JCODE_REPO_SOURCE_STATE: LazyLock<(Option<String>, Option<bool>)> = LazyL
 static WORKING_GIT_STATE_CACHE: LazyLock<StdMutex<HashMap<PathBuf, Option<GitState>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 const STREAM_KEEPALIVE_PONG_ID: u64 = 0;
+
+fn stable_hash_str(value: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn stable_hash_json<T: serde::Serialize + ?Sized>(value: &T) -> u64 {
+    let encoded = serde_json::to_string(value).unwrap_or_default();
+    stable_hash_str(&encoded)
+}
+
+fn stable_json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
+    serde_json::to_string(value)
+        .map(|encoded| encoded.len())
+        .unwrap_or_default()
+}
+
+fn message_hashes(messages: &[Message]) -> Vec<u64> {
+    messages.iter().map(stable_hash_json).collect()
+}
+
+fn kv_cache_request_event(
+    messages: &[Message],
+    tools: &[ToolDefinition],
+    system_static: &str,
+    ephemeral_messages: &[Message],
+) -> ServerEvent {
+    let ephemeral_hash = if ephemeral_messages.is_empty() {
+        None
+    } else {
+        Some(stable_hash_json(ephemeral_messages))
+    };
+    ServerEvent::KvCacheRequest {
+        system_static_hash: stable_hash_str(system_static),
+        tools_hash: stable_hash_json(tools),
+        messages_hash: stable_hash_json(messages),
+        message_hashes: message_hashes(messages),
+        message_count: messages.len(),
+        tool_count: tools.len(),
+        system_static_chars: system_static.chars().count(),
+        tools_json_chars: stable_json_len(tools),
+        messages_json_chars: stable_json_len(messages),
+        ephemeral_hash,
+        ephemeral_chars: stable_json_len(ephemeral_messages),
+        ephemeral_message_count: ephemeral_messages.len(),
+    }
+}
 
 /// Token usage from the last API request
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -133,6 +182,8 @@ pub struct Agent {
     rewind_undo_snapshot: Option<RewindUndoSnapshot>,
     /// Channel for tools to request stdin input from the user
     stdin_request_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tool::StdinInputRequest>>,
+    /// Canonical reducer-backed view of runtime provider/model selection.
+    provider_runtime_state: ProviderRuntimeState,
 }
 
 impl Agent {
@@ -153,6 +204,7 @@ impl Agent {
         allowed_tools: Option<HashSet<String>>,
     ) -> Self {
         let skills = SkillRegistry::shared_snapshot();
+        let initial_provider_model = provider.model();
         Self {
             provider,
             registry,
@@ -179,6 +231,7 @@ impl Agent {
             memory_enabled: crate::config::config().features.memory,
             rewind_undo_snapshot: None,
             stdin_request_tx: None,
+            provider_runtime_state: ProviderRuntimeState::observed(initial_provider_model),
         }
     }
 
@@ -430,7 +483,7 @@ impl Agent {
     }
 
     fn messages_for_provider(&mut self) -> (Vec<Message>, Option<CompactionEvent>) {
-        if self.provider.uses_jcode_compaction() || self.session.compaction.is_some() {
+        if self.provider.supports_compaction() || self.session.compaction.is_some() {
             let compaction = self.registry.compaction();
             match compaction.try_write() {
                 Ok(mut manager) => {
@@ -461,13 +514,13 @@ impl Agent {
                         }
                         manager.messages_for_api_with(all_messages)
                     };
-                    let event = if self.provider.uses_jcode_compaction() {
-                        manager.take_compaction_event()
-                    } else {
-                        None
-                    };
+                    let event = manager.take_compaction_event();
                     if event.is_some() || discarded_oversized_native {
                         self.sync_session_compaction_state_from_manager(&manager);
+                    }
+                    if event.is_some() {
+                        self.note_compaction_applied();
+                        self.persist_session_best_effort("compaction completion");
                     }
                     let user_count = messages
                         .iter()
@@ -648,6 +701,13 @@ impl Agent {
 
     pub fn session_id(&self) -> &str {
         &self.session.id
+    }
+
+    pub(crate) fn set_working_dir_for_pending_context(&mut self, working_dir: Option<String>) {
+        if working_dir.is_some() {
+            self.session.working_dir = working_dir;
+            self.session.refresh_initial_session_context_message();
+        }
     }
 
     /// Mark this agent session as closed and persist it.

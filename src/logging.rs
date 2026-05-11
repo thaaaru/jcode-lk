@@ -105,6 +105,12 @@ fn task_context_snapshot() -> Option<LogContext> {
     contexts.get(&task_id).cloned()
 }
 
+/// Snapshot the current logging context for diagnostics that need stable,
+/// session-scoped in-memory keys in addition to the rendered log prefix.
+pub fn current_context_snapshot() -> LogContext {
+    task_context_snapshot().unwrap_or_else(|| LOG_CONTEXT.with(|c| c.borrow().clone()))
+}
+
 fn context_prefix_for(ctx: &LogContext) -> String {
     let mut parts = Vec::new();
 
@@ -241,6 +247,31 @@ pub fn debug(message: &str) {
     }
 }
 
+/// Log a structured auth event with conservative redaction.
+///
+/// Callers should pass only non-secret metadata. This function still redacts any
+/// field whose key looks credential-like so accidental tokens/keys do not land in
+/// logs.
+pub fn auth_event(event: &str, provider: &str, fields: &[(&str, &str)]) {
+    let mut parts = vec![
+        format!("event={}", sanitize_log_value(event)),
+        format!("provider={}", sanitize_log_value(provider)),
+    ];
+    for (key, value) in fields {
+        parts.push(format!(
+            "{}={}",
+            sanitize_log_value(key),
+            redact_auth_field(key, value)
+        ));
+    }
+    let msg = format!("AUTH {}", parts.join(" "));
+    if let Ok(mut guard) = LOGGER.lock()
+        && let Some(logger) = guard.as_mut()
+    {
+        logger.write("AUTH", &msg);
+    }
+}
+
 /// Log a tool call
 #[expect(
     clippy::collapsible_if,
@@ -315,5 +346,63 @@ fn truncate(s: &str, max_len: usize) -> String {
         format!("{}...", crate::util::truncate_str(s, max_len))
     } else {
         s.to_string()
+    }
+}
+
+fn redact_auth_field(key: &str, value: &str) -> String {
+    let key = key.to_ascii_lowercase();
+    if key.contains("token")
+        || key.contains("secret")
+        || key.contains("key")
+        || key.contains("credential")
+        || key.contains("callback")
+        || key.contains("code")
+        || key.contains("authorization")
+    {
+        return "<redacted>".to_string();
+    }
+    sanitize_log_value(value)
+}
+
+fn sanitize_log_value(value: &str) -> String {
+    let value = value.replace(['\n', '\r', '\t'], " ");
+    let value = redact_url_queries(&value);
+    truncate(&value, 160)
+}
+
+fn redact_url_queries(value: &str) -> String {
+    value
+        .split(' ')
+        .map(|word| {
+            if (word.starts_with("http://") || word.starts_with("https://")) && word.contains('?') {
+                let (base, _) = word.split_once('?').unwrap_or((word, ""));
+                format!("{}?<redacted>", base)
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_log_redacts_secret_like_fields() {
+        assert_eq!(redact_auth_field("api_key", "sk-secret"), "<redacted>");
+        assert_eq!(
+            redact_auth_field("callback_url", "https://example.com/?code=secret"),
+            "<redacted>"
+        );
+    }
+
+    #[test]
+    fn auth_log_sanitizes_urls_and_control_characters() {
+        assert_eq!(
+            sanitize_log_value("failed\nhttps://login.example.com/cb?code=secret&state=abc"),
+            "failed https://login.example.com/cb?<redacted>"
+        );
     }
 }

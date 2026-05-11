@@ -124,11 +124,11 @@ impl DiffDisplayMode {
 #[serde(rename_all = "lowercase")]
 pub enum DiagramDisplayMode {
     /// Don't show diagrams in dedicated widgets (only inline in messages).
+    #[default]
     None,
     /// Show diagrams in info widget margins (opportunistic, if space available).
     Margin,
     /// Show diagrams in a dedicated pinned pane (forces space allocation).
-    #[default]
     Pinned,
 }
 
@@ -503,7 +503,8 @@ pub struct DisplayConfig {
     pub centered: bool,
     /// Show thinking/reasoning content by default (default: false)
     pub show_thinking: bool,
-    /// How to display mermaid diagrams (none/margin/pinned, default: pinned)
+    /// How to display mermaid diagrams (none/margin/pinned, default: none).
+    /// Mermaid rendering is temporarily disabled for users unless JCODE_ENABLE_MERMAID=1.
     pub diagram_mode: DiagramDisplayMode,
     /// Markdown block spacing style (compact/document, default: compact)
     pub markdown_spacing: MarkdownSpacingMode,
@@ -627,7 +628,7 @@ impl Default for ProviderConfig {
             default_provider: None,
             openai_reasoning_effort: Some("low".to_string()),
             openai_transport: None,
-            openai_service_tier: None,
+            openai_service_tier: Some("priority".to_string()),
             openai_native_compaction_mode: "auto".to_string(),
             openai_native_compaction_threshold_tokens: 200_000,
             cross_provider_failover: CrossProviderFailoverMode::Countdown,

@@ -1,5 +1,6 @@
 mod accessors;
 mod account_failover;
+pub mod activation;
 pub mod anthropic;
 pub mod antigravity;
 pub mod bedrock;
@@ -8,6 +9,7 @@ pub mod copilot;
 pub mod cursor;
 mod dispatch;
 mod failover;
+mod fingerprint;
 pub mod gemini;
 pub mod jcode;
 pub mod models;
@@ -20,6 +22,7 @@ mod route_builders;
 mod routing;
 mod selection;
 mod startup;
+pub mod state;
 pub mod subagent_rate_limiter;
 
 use crate::auth;
@@ -37,12 +40,12 @@ use std::sync::{Arc, RwLock};
 
 pub use jcode_provider_core::{
     ALL_CLAUDE_MODELS, ALL_OPENAI_MODELS, CHEAPNESS_REFERENCE_INPUT_TOKENS,
-    CHEAPNESS_REFERENCE_OUTPUT_TOKENS, DEFAULT_CONTEXT_LIMIT, EventStream, ModelCapabilities,
-    ModelCatalogRefreshSummary, ModelRoute, NativeCompactionResult, NativeToolResult,
-    NativeToolResultSender, PremiumMode, Provider, RouteBillingKind, RouteCheapnessEstimate,
-    RouteCostConfidence, RouteCostSource, dedupe_model_routes, explicit_model_provider_prefix,
-    model_name_for_provider, normalize_copilot_model_name, provider_from_model_key,
-    shared_http_client, summarize_model_catalog_refresh,
+    CHEAPNESS_REFERENCE_OUTPUT_TOKENS, DEFAULT_CONTEXT_LIMIT, EventStream, JCODE_USER_AGENT,
+    ModelCapabilities, ModelCatalogRefreshSummary, ModelRoute, NativeCompactionResult,
+    NativeToolResult, NativeToolResultSender, PremiumMode, Provider, RouteBillingKind,
+    RouteCheapnessEstimate, RouteCostConfidence, RouteCostSource, dedupe_model_routes,
+    explicit_model_provider_prefix, model_name_for_provider, normalize_copilot_model_name,
+    provider_from_model_key, shared_http_client, summarize_model_catalog_refresh,
 };
 pub(crate) use jcode_provider_core::{ProviderFailoverPrompt, parse_failover_prompt_message};
 pub use route_builders::{
@@ -61,6 +64,11 @@ pub fn set_model_with_auth_refresh(provider: &dyn Provider, model: &str) -> Resu
         Ok(()) => Ok(()),
         Err(first_err) => {
             let first_message = first_err.to_string();
+            crate::logging::auth_event(
+                "auth_changed_retry_after_set_model_failure",
+                provider.name(),
+                &[("reason", first_message.as_str())],
+            );
             provider.on_auth_changed();
             provider.set_model(model).map_err(|second_err| {
                 anyhow::anyhow!(
@@ -95,7 +103,12 @@ pub use self::models::{
     should_refresh_openai_model_catalog,
 };
 use self::pricing::cheapness_for_route;
+pub use self::selection::DefaultModelSelection;
 use self::selection::{ActiveProvider, ProviderAvailability};
+use self::state::ProviderState;
+pub(crate) use self::state::{
+    ProviderModelSelectionSource, ProviderRuntimeState, ProviderStateEvent,
+};
 
 /// MultiProvider wraps multiple providers and allows seamless model switching
 pub struct MultiProvider {
@@ -482,6 +495,200 @@ impl MultiProvider {
         Ok(())
     }
 
+    fn should_replace_openrouter_after_auth_change(
+        existing: &openrouter::OpenRouterProvider,
+        candidate: &openrouter::OpenRouterProvider,
+    ) -> bool {
+        if existing.supports_provider_routing_features()
+            != candidate.supports_provider_routing_features()
+        {
+            return false;
+        }
+
+        let existing_direct = existing
+            .direct_openai_compatible_route_parts()
+            .map(|(_provider, api_method, _detail)| api_method);
+        let candidate_direct = candidate
+            .direct_openai_compatible_route_parts()
+            .map(|(_provider, api_method, _detail)| api_method);
+
+        existing_direct == candidate_direct
+    }
+
+    fn handle_auth_changed(&self, preserve_existing_openrouter_profile: bool) {
+        crate::logging::auth_event("auth_changed_received", "multi-provider", &[]);
+        // Auth just changed, so discard any stale full/fast snapshots before
+        // using cheap local probes to hot-initialize newly configured providers.
+        crate::auth::AuthStatus::invalidate_cache();
+
+        if self.use_claude_cli {
+            if self.claude_provider().is_none() && crate::auth::claude::load_credentials().is_ok() {
+                crate::logging::info("Hot-initialized Claude CLI provider after auth change");
+                *self
+                    .claude
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(Arc::new(claude::ClaudeProvider::new()));
+            }
+        } else if self.anthropic_provider().is_none()
+            && crate::auth::claude::load_credentials().is_ok()
+        {
+            crate::logging::info("Hot-initialized Anthropic provider after auth change");
+            *self
+                .anthropic
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(Arc::new(anthropic::AnthropicProvider::new()));
+        }
+
+        if let Some(openai) = self.openai_provider() {
+            openai.reload_credentials_now();
+        } else if let Ok(credentials) = crate::auth::codex::load_credentials() {
+            crate::logging::info("Hot-initialized OpenAI provider after auth change");
+            *self
+                .openai
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(Arc::new(openai::OpenAIProvider::new(credentials)));
+        }
+
+        if openrouter::OpenRouterProvider::has_credentials() {
+            match openrouter::OpenRouterProvider::new() {
+                Ok(provider) => {
+                    let should_install = if preserve_existing_openrouter_profile {
+                        self.openrouter_provider()
+                            .as_deref()
+                            .map(|existing| {
+                                Self::should_replace_openrouter_after_auth_change(
+                                    existing, &provider,
+                                )
+                            })
+                            .unwrap_or(true)
+                    } else {
+                        true
+                    };
+                    if should_install {
+                        crate::logging::info(
+                            "Hot-initialized OpenRouter/OpenAI-compatible provider after auth change",
+                        );
+                        *self
+                            .openrouter
+                            .write()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(Arc::new(provider));
+                    } else {
+                        crate::logging::info(
+                            "Preserved existing OpenRouter/OpenAI-compatible provider after unrelated auth change",
+                        );
+                    }
+                }
+                Err(e) => {
+                    crate::logging::info(&format!(
+                        "Failed to hot-initialize OpenRouter/OpenAI-compatible provider after auth change: {}",
+                        e
+                    ));
+                }
+            }
+        }
+
+        let already_has = self.copilot_provider().is_some();
+        if !already_has {
+            let status = crate::auth::AuthStatus::check_fast();
+            if status.copilot_has_api_token {
+                match copilot::CopilotApiProvider::new() {
+                    Ok(p) => {
+                        crate::logging::info("Hot-initialized Copilot API provider after login");
+                        let provider = Arc::new(p);
+                        let p_clone = provider.clone();
+                        tokio::spawn(async move {
+                            p_clone.detect_tier_and_set_default().await;
+                        });
+                        *self
+                            .copilot_api
+                            .write()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(provider);
+                    }
+                    Err(e) => {
+                        crate::logging::info(&format!(
+                            "Failed to hot-initialize Copilot API after login: {}",
+                            e
+                        ));
+                    }
+                }
+            }
+        }
+
+        let already_has_antigravity = self.antigravity_provider().is_some();
+        if !already_has_antigravity && crate::auth::antigravity::load_tokens().is_ok() {
+            crate::logging::info("Hot-initialized Antigravity provider after login");
+            *self
+                .antigravity
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(Arc::new(antigravity::AntigravityProvider::new()));
+        }
+
+        let already_has_gemini = self.gemini_provider().is_some();
+        if !already_has_gemini && crate::auth::gemini::load_tokens().is_ok() {
+            crate::logging::info("Hot-initialized Gemini provider after login");
+            *self
+                .gemini
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(Arc::new(gemini::GeminiProvider::new()));
+        }
+
+        let already_has_cursor = self.cursor_provider().is_some();
+        if !already_has_cursor
+            && crate::auth::AuthStatus::check_fast()
+                .assessment_for_provider(crate::provider_catalog::CURSOR_LOGIN_PROVIDER)
+                .is_available()
+        {
+            crate::logging::info("Hot-initialized Cursor provider after login");
+            *self
+                .cursor
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(Arc::new(cursor::CursorCliProvider::new()));
+        }
+
+        let already_has_bedrock = self.bedrock_provider().is_some();
+        if !already_has_bedrock && bedrock::BedrockProvider::has_credentials() {
+            crate::logging::info("Hot-initialized AWS Bedrock provider after login");
+            *self
+                .bedrock
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(Arc::new(bedrock::BedrockProvider::new()));
+        }
+
+        if let Some(anthropic) = self.anthropic_provider() {
+            Self::spawn_post_auth_model_refresh(anthropic, "Anthropic");
+        }
+        if let Some(claude) = self.claude_provider() {
+            Self::spawn_post_auth_model_refresh(claude, "Claude");
+        }
+        if let Some(openai) = self.openai_provider() {
+            Self::spawn_post_auth_model_refresh(openai, "OpenAI");
+        }
+        if let Some(antigravity) = self.antigravity_provider() {
+            Self::spawn_post_auth_model_refresh(antigravity, "Antigravity");
+        }
+        if let Some(gemini) = self.gemini_provider() {
+            Self::spawn_post_auth_model_refresh(gemini, "Gemini");
+        }
+        if let Some(cursor) = self.cursor_provider() {
+            Self::spawn_post_auth_model_refresh(cursor, "Cursor");
+        }
+        if let Some(openrouter) = self.openrouter_provider() {
+            Self::spawn_post_auth_model_refresh(openrouter, "OpenRouter");
+        }
+        if let Some(bedrock) = self.bedrock_provider() {
+            Self::spawn_post_auth_model_refresh(bedrock, "AWS Bedrock");
+        }
+        crate::logging::auth_event("auth_changed_completed", "multi-provider", &[]);
+    }
+
     pub(super) fn set_config_default_model(
         &self,
         model: &str,
@@ -502,14 +709,10 @@ impl MultiProvider {
             let trimmed = pref.trim();
             (!trimmed.is_empty()).then_some(trimmed)
         }) {
-            if crate::provider_catalog::resolve_openai_compatible_profile_selection(pref).is_some()
-                || crate::config::config().providers.contains_key(pref)
+            if let Some(selection) =
+                Self::resolve_config_provider_selection(pref, crate::config::config())
             {
-                return self.set_model_on_provider(ActiveProvider::OpenRouter, model);
-            }
-
-            if let Some(provider) = Self::parse_provider_hint(pref) {
-                return self.set_model_on_provider(provider, model);
+                return self.set_model_on_provider(selection.active_provider(), model);
             }
         }
 
@@ -1019,20 +1222,27 @@ impl Provider for MultiProvider {
         }
 
         // OpenRouter models (with per-provider endpoints)
-        let has_openrouter = self.openrouter_provider().is_some();
-        if let Some(openrouter) = self.openrouter_provider() {
-            let openai_compatible_provider_label =
-                crate::provider_catalog::active_openai_compatible_display_name()
-                    .unwrap_or_else(|| "OpenAI-compatible".to_string());
+        let openrouter_provider = self.openrouter_provider();
+        let has_openrouter = openrouter_provider.is_some();
+        let has_openrouter_provider_features = openrouter_provider
+            .as_ref()
+            .map(|openrouter| openrouter.supports_provider_routing_features())
+            .unwrap_or(false);
+        if let Some(openrouter) = openrouter_provider {
             let current_openrouter_model = openrouter.model();
             let supports_openrouter_provider_features =
                 openrouter.supports_provider_routing_features();
             let mut scheduled_endpoint_refreshes = 0usize;
             for model in openrouter.available_models_display() {
                 openrouter_models += 1;
-                let cached = openrouter::load_endpoints_disk_cache_public(&model);
+                let cached = if supports_openrouter_provider_features {
+                    openrouter::load_endpoints_disk_cache_public(&model)
+                } else {
+                    None
+                };
                 let cache_age = cached.as_ref().map(|(_, age)| *age);
-                if (model == current_openrouter_model || scheduled_endpoint_refreshes < 8)
+                if supports_openrouter_provider_features
+                    && (model == current_openrouter_model || scheduled_endpoint_refreshes < 8)
                     && openrouter.maybe_schedule_endpoint_refresh_for_display(
                         &model,
                         cache_age,
@@ -1072,17 +1282,26 @@ impl Provider for MultiProvider {
                         auto_detail,
                     ));
                 } else {
+                    let (provider, api_method, detail) = openrouter
+                        .direct_openai_compatible_route_parts()
+                        .unwrap_or_else(|| {
+                            (
+                                "OpenAI-compatible".to_string(),
+                                "openai-compatible".to_string(),
+                                "custom endpoint".to_string(),
+                            )
+                        });
                     routes.push(ModelRoute {
                         model: model.clone(),
-                        provider: openai_compatible_provider_label.clone(),
-                        api_method: "openai-compatible".to_string(),
+                        provider,
+                        api_method,
                         available: has_openrouter,
-                        detail: "custom endpoint".to_string(),
+                        detail,
                         cheapness: None,
                     });
                 }
                 // Add per-provider routes from endpoints cache
-                if let Some((ref endpoints, _)) = cached {
+                if supports_openrouter_provider_features && let Some((ref endpoints, _)) = cached {
                     openrouter_endpoint_cache_hits += 1;
                     let stale_suffix = age_str.as_deref().unwrap_or("");
                     for ep in endpoints {
@@ -1111,7 +1330,7 @@ impl Provider for MultiProvider {
         }
 
         // Also add Claude/OpenAI models via openrouter as alternative routes
-        if has_openrouter {
+        if has_openrouter_provider_features {
             for model in known_anthropic_model_ids() {
                 let or_model = format!("anthropic/{}", model);
                 if let Some((endpoints, _)) =
@@ -1218,158 +1437,11 @@ impl Provider for MultiProvider {
     }
 
     fn on_auth_changed(&self) {
-        // Auth just changed, so discard any stale full/fast snapshots before
-        // using cheap local probes to hot-initialize newly configured providers.
-        crate::auth::AuthStatus::invalidate_cache();
+        self.handle_auth_changed(false);
+    }
 
-        if self.use_claude_cli {
-            if self.claude_provider().is_none() && crate::auth::claude::load_credentials().is_ok() {
-                crate::logging::info("Hot-initialized Claude CLI provider after auth change");
-                *self
-                    .claude
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    Some(Arc::new(claude::ClaudeProvider::new()));
-            }
-        } else if self.anthropic_provider().is_none()
-            && crate::auth::claude::load_credentials().is_ok()
-        {
-            crate::logging::info("Hot-initialized Anthropic provider after auth change");
-            *self
-                .anthropic
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some(Arc::new(anthropic::AnthropicProvider::new()));
-        }
-
-        if let Some(openai) = self.openai_provider() {
-            openai.reload_credentials_now();
-        } else if let Ok(credentials) = crate::auth::codex::load_credentials() {
-            crate::logging::info("Hot-initialized OpenAI provider after auth change");
-            *self
-                .openai
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some(Arc::new(openai::OpenAIProvider::new(credentials)));
-        }
-
-        if openrouter::OpenRouterProvider::has_credentials() {
-            match openrouter::OpenRouterProvider::new() {
-                Ok(provider) => {
-                    crate::logging::info(
-                        "Hot-initialized OpenRouter/OpenAI-compatible provider after auth change",
-                    );
-                    *self
-                        .openrouter
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                        Some(Arc::new(provider));
-                }
-                Err(e) => {
-                    crate::logging::info(&format!(
-                        "Failed to hot-initialize OpenRouter/OpenAI-compatible provider after auth change: {}",
-                        e
-                    ));
-                }
-            }
-        }
-
-        let already_has = self.copilot_provider().is_some();
-        if !already_has {
-            let status = crate::auth::AuthStatus::check_fast();
-            if status.copilot_has_api_token {
-                match copilot::CopilotApiProvider::new() {
-                    Ok(p) => {
-                        crate::logging::info("Hot-initialized Copilot API provider after login");
-                        let provider = Arc::new(p);
-                        let p_clone = provider.clone();
-                        tokio::spawn(async move {
-                            p_clone.detect_tier_and_set_default().await;
-                        });
-                        *self
-                            .copilot_api
-                            .write()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(provider);
-                    }
-                    Err(e) => {
-                        crate::logging::info(&format!(
-                            "Failed to hot-initialize Copilot API after login: {}",
-                            e
-                        ));
-                    }
-                }
-            }
-        }
-
-        let already_has_antigravity = self.antigravity_provider().is_some();
-        if !already_has_antigravity && crate::auth::antigravity::load_tokens().is_ok() {
-            crate::logging::info("Hot-initialized Antigravity provider after login");
-            *self
-                .antigravity
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some(Arc::new(antigravity::AntigravityProvider::new()));
-        }
-
-        let already_has_gemini = self.gemini_provider().is_some();
-        if !already_has_gemini && crate::auth::gemini::load_tokens().is_ok() {
-            crate::logging::info("Hot-initialized Gemini provider after login");
-            *self
-                .gemini
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some(Arc::new(gemini::GeminiProvider::new()));
-        }
-
-        let already_has_cursor = self.cursor_provider().is_some();
-        if !already_has_cursor
-            && matches!(
-                crate::auth::AuthStatus::check_fast().cursor,
-                crate::auth::AuthState::Available
-            )
-        {
-            crate::logging::info("Hot-initialized Cursor provider after login");
-            *self
-                .cursor
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some(Arc::new(cursor::CursorCliProvider::new()));
-        }
-
-        let already_has_bedrock = self.bedrock_provider().is_some();
-        if !already_has_bedrock && bedrock::BedrockProvider::has_credentials() {
-            crate::logging::info("Hot-initialized AWS Bedrock provider after login");
-            *self
-                .bedrock
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some(Arc::new(bedrock::BedrockProvider::new()));
-        }
-
-        if let Some(anthropic) = self.anthropic_provider() {
-            Self::spawn_post_auth_model_refresh(anthropic, "Anthropic");
-        }
-        if let Some(claude) = self.claude_provider() {
-            Self::spawn_post_auth_model_refresh(claude, "Claude");
-        }
-        if let Some(openai) = self.openai_provider() {
-            Self::spawn_post_auth_model_refresh(openai, "OpenAI");
-        }
-        if let Some(antigravity) = self.antigravity_provider() {
-            Self::spawn_post_auth_model_refresh(antigravity, "Antigravity");
-        }
-        if let Some(gemini) = self.gemini_provider() {
-            Self::spawn_post_auth_model_refresh(gemini, "Gemini");
-        }
-        if let Some(cursor) = self.cursor_provider() {
-            Self::spawn_post_auth_model_refresh(cursor, "Cursor");
-        }
-        if let Some(openrouter) = self.openrouter_provider() {
-            Self::spawn_post_auth_model_refresh(openrouter, "OpenRouter");
-        }
-        if let Some(bedrock) = self.bedrock_provider() {
-            Self::spawn_post_auth_model_refresh(bedrock, "AWS Bedrock");
-        }
+    fn on_auth_changed_preserve_current_provider(&self) {
+        self.handle_auth_changed(true);
     }
 
     async fn invalidate_credentials(&self) {
@@ -1421,7 +1493,9 @@ impl Provider for MultiProvider {
             ActiveProvider::Gemini => None,
             ActiveProvider::Cursor => None,
             ActiveProvider::Bedrock => None,
-            ActiveProvider::OpenRouter => None,
+            ActiveProvider::OpenRouter => self
+                .openrouter_provider()
+                .and_then(|o| o.reasoning_effort()),
         }
     }
 
@@ -1430,6 +1504,10 @@ impl Provider for MultiProvider {
             ActiveProvider::OpenAI => self
                 .openai_provider()
                 .ok_or_else(|| anyhow::anyhow!("OpenAI provider not available"))?
+                .set_reasoning_effort(effort),
+            ActiveProvider::OpenRouter => self
+                .openrouter_provider()
+                .ok_or_else(|| anyhow::anyhow!("OpenAI-compatible provider not available"))?
                 .set_reasoning_effort(effort),
             _ => Err(anyhow::anyhow!(
                 "Reasoning effort is only supported for OpenAI models"
@@ -1441,6 +1519,10 @@ impl Provider for MultiProvider {
         match self.active_provider() {
             ActiveProvider::OpenAI => self
                 .openai_provider()
+                .map(|o| o.available_efforts())
+                .unwrap_or_default(),
+            ActiveProvider::OpenRouter => self
+                .openrouter_provider()
                 .map(|o| o.available_efforts())
                 .unwrap_or_default(),
             ActiveProvider::Copilot => vec![],

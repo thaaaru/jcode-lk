@@ -616,7 +616,7 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
-    if code == KeyCode::Enter && modifiers.contains(KeyModifiers::SHIFT) {
+    if code == KeyCode::Enter && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
         input::insert_input_text(app, "\n");
         app.follow_chat_bottom_for_typing();
         return Ok(());
@@ -812,6 +812,16 @@ async fn handle_remote_key_internal(
                         app.remote_available_entries.clone(),
                         app.remote_model_options.clone(),
                     ));
+                    super::super::local::handle_ui_activity(
+                        app,
+                        crate::bus::UiActivity::catalog(
+                            app.remote_session_id
+                                .clone()
+                                .or_else(|| Some(app.session.id.clone())),
+                            "**Model List Refresh Started**\n\nAsked the remote server to refresh the provider model catalog. Jcode will show the discovered model and route changes when the server responds.",
+                            Some("Refreshing model list..."),
+                        ),
+                    );
                     match remote.refresh_models().await {
                         Ok(()) => app.set_status_notice("Refreshing model list..."),
                         Err(error) => {
@@ -924,6 +934,7 @@ async fn handle_remote_key_internal(
                     }
                     app.upstream_provider = None;
                     remote.set_model(model_name).await?;
+                    app.remote_model_switch_in_flight = true;
                     return Ok(());
                 }
 
@@ -1521,6 +1532,7 @@ async fn handle_remote_key_internal(
                         )));
                         return Ok(());
                     }
+                    crate::tui::session_picker::invalidate_session_list_cache();
                     if app.memory_enabled
                         && let Err(err) = remote.trigger_memory_extraction().await
                     {
@@ -1556,6 +1568,7 @@ async fn handle_remote_key_internal(
                         )));
                         return Ok(());
                     }
+                    crate::tui::session_picker::invalidate_session_list_cache();
                     let name = app.session.display_name().to_string();
                     app.push_display_message(DisplayMessage::system(format!(
                         "Removed bookmark from session **{}**.",

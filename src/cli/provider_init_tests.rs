@@ -1,5 +1,6 @@
 use super::*;
 use crate::provider_catalog::{self, resolve_login_selection, resolve_openai_compatible_profile};
+use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
 
@@ -14,6 +15,7 @@ fn lock_env() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_provider_choice_arg_values() {
     assert_eq!(ProviderChoice::Jcode.as_arg_value(), "jcode");
     assert_eq!(ProviderChoice::Claude.as_arg_value(), "claude");
@@ -121,6 +123,7 @@ fn test_init_provider_jcode_delegates_runtime_profile_to_wrapper() {
     let _env_guard = crate::storage::lock_test_env();
     crate::subscription_catalog::clear_runtime_env();
     crate::env::remove_var("JCODE_OPENROUTER_MODEL");
+    crate::env::remove_var("JCODE_RUNTIME_PROVIDER");
     crate::env::remove_var("JCODE_ACTIVE_PROVIDER");
     crate::env::remove_var("JCODE_FORCE_PROVIDER");
 
@@ -140,12 +143,17 @@ fn test_init_provider_jcode_delegates_runtime_profile_to_wrapper() {
         Some("openrouter")
     );
     assert_eq!(
+        std::env::var("JCODE_RUNTIME_PROVIDER").ok().as_deref(),
+        Some("jcode")
+    );
+    assert_eq!(
         std::env::var("JCODE_FORCE_PROVIDER").ok().as_deref(),
         Some("1")
     );
 
     crate::subscription_catalog::clear_runtime_env();
     crate::env::remove_var("JCODE_OPENROUTER_MODEL");
+    crate::env::remove_var("JCODE_RUNTIME_PROVIDER");
     crate::env::remove_var("JCODE_ACTIVE_PROVIDER");
     crate::env::remove_var("JCODE_FORCE_PROVIDER");
 }
@@ -342,6 +350,80 @@ fn choice_for_login_provider_round_trips_openai_compatible_profiles() {
 }
 
 #[test]
+fn login_provider_choice_table_round_trips_catalog_providers() {
+    let mut seen_choices = HashSet::new();
+    let mut reverse_mapped_provider_ids = HashSet::new();
+
+    for (choice, provider) in login_provider_choice_mappings() {
+        assert!(
+            seen_choices.insert(choice.as_arg_value()),
+            "duplicate provider choice mapping for {}",
+            choice.as_arg_value()
+        );
+        assert_eq!(
+            login_provider_for_choice(choice).map(|candidate| candidate.id),
+            Some(provider.id),
+            "choice {} should resolve to {}",
+            choice.as_arg_value(),
+            provider.id
+        );
+
+        if reverse_mapped_provider_ids.insert(provider.id) {
+            assert_eq!(
+                choice_for_login_provider(*provider),
+                Some(*choice),
+                "provider {} should reverse-map to {}",
+                provider.id,
+                choice.as_arg_value()
+            );
+        }
+    }
+
+    for provider in provider_catalog::login_providers() {
+        if matches!(
+            provider.target,
+            provider_catalog::LoginProviderTarget::AutoImport
+        ) {
+            assert_eq!(choice_for_login_provider(*provider), None);
+        } else {
+            assert!(
+                reverse_mapped_provider_ids.contains(provider.id),
+                "provider {} is in the catalog but not the CLI choice table",
+                provider.id
+            );
+        }
+    }
+}
+
+#[test]
+fn auth_integration_registry_matches_cli_choice_runtime_wiring() {
+    for provider in provider_catalog::login_providers() {
+        let integration = crate::auth::integration::auth_provider_integration(provider.id)
+            .expect("catalog provider should have integration metadata");
+        assert_eq!(integration.descriptor, *provider);
+
+        if !matches!(
+            provider.target,
+            provider_catalog::LoginProviderTarget::AutoImport
+        ) {
+            assert!(
+                choice_for_login_provider(*provider).is_some(),
+                "provider {} is missing a CLI choice mapping",
+                provider.id
+            );
+        }
+
+        let status = auth::AuthStatus::default();
+        let assessment = status.assessment_for_provider(*provider);
+        assert!(
+            !assessment.method_detail.is_empty(),
+            "provider {} should have non-empty auth status method detail",
+            provider.id
+        );
+    }
+}
+
+#[test]
 fn resolved_profile_default_model_uses_openai_compatible_override() {
     let _guard = lock_env();
     let _env_guard = crate::storage::lock_test_env();
@@ -390,6 +472,7 @@ async fn init_provider_for_ollama_reapplies_local_compat_runtime_env_after_disab
         "JCODE_OPENROUTER_CACHE_NAMESPACE",
         "JCODE_OPENROUTER_PROVIDER_FEATURES",
         "JCODE_OPENROUTER_ALLOW_NO_AUTH",
+        "JCODE_RUNTIME_PROVIDER",
         "JCODE_FORCE_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
     ]
@@ -432,6 +515,10 @@ async fn init_provider_for_ollama_reapplies_local_compat_runtime_env_after_disab
         std::env::var("JCODE_ACTIVE_PROVIDER").ok().as_deref(),
         Some("openrouter")
     );
+    assert_eq!(
+        std::env::var("JCODE_RUNTIME_PROVIDER").ok().as_deref(),
+        Some("openai-compatible")
+    );
     assert_eq!(provider.name(), "openrouter");
     assert_eq!(provider.model(), "llama3.2");
 
@@ -462,6 +549,7 @@ async fn auto_provider_noninteractive_skips_untrusted_external_auth_instead_of_b
         "GITHUB_TOKEN",
         "GEMINI_API_KEY",
         "CURSOR_API_KEY",
+        "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
         "JCODE_FORCE_PROVIDER",
     ]

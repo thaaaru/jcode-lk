@@ -100,6 +100,27 @@ async fn write_direct_event(
     Ok(())
 }
 
+fn compaction_server_event(event: crate::compaction::CompactionEvent) -> ServerEvent {
+    ServerEvent::Compaction {
+        trigger: event.trigger,
+        pre_tokens: event.pre_tokens,
+        post_tokens: event.post_tokens,
+        tokens_saved: event.tokens_saved,
+        duration_ms: event.duration_ms,
+        messages_dropped: event.messages_dropped,
+        messages_compacted: event.messages_compacted,
+        summary_chars: event.summary_chars,
+        active_messages: event.active_messages,
+    }
+}
+
+async fn poll_agent_compaction_completion(agent: Arc<Mutex<Agent>>) -> Option<ServerEvent> {
+    let mut agent_guard = agent.lock().await;
+    agent_guard
+        .poll_compaction_completion_event()
+        .map(compaction_server_event)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "lightweight comm dispatch still needs access to the same shared swarm/session state"
@@ -1177,6 +1198,15 @@ pub(super) async fn handle_client(
                             });
                         }
                     }
+                    Ok(BusEvent::CompactionFinished) => {
+                        let agent = Arc::clone(&agent);
+                        let tx = client_event_tx.clone();
+                        tokio::spawn(async move {
+                            if let Some(event) = poll_agent_compaction_completion(agent).await {
+                                let _ = tx.send(event);
+                            }
+                        });
+                    }
                     _ => {}
                 }
                 continue;
@@ -1804,9 +1834,15 @@ pub(super) async fn handle_client(
                 .await;
             }
 
-            Request::NotifyAuthChanged { id } => {
+            Request::NotifyAuthChanged {
+                id,
+                provider: provider_hint,
+                auth,
+            } => {
                 handle_notify_auth_changed(
                     id,
+                    provider_hint,
+                    auth,
                     &provider,
                     &provider_template,
                     &sessions,

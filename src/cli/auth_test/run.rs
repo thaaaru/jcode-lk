@@ -85,6 +85,11 @@ async fn run_post_login_validation_inner(
     verbose: bool,
 ) -> Result<()> {
     let Some(choice) = super::provider_init::choice_for_login_provider(provider) else {
+        crate::logging::auth_event(
+            "post_login_validation_skipped",
+            provider.id,
+            &[("reason", "no_runtime_provider_choice")],
+        );
         if verbose {
             eprintln!(
                 "\nSkipping automatic runtime validation for {}. Auto Import can add multiple providers; run `jcode auth-test --all-configured` to validate them.",
@@ -95,6 +100,11 @@ async fn run_post_login_validation_inner(
     };
 
     super::provider_init::apply_login_provider_profile_env(provider);
+    crate::logging::auth_event(
+        "post_login_validation_started",
+        provider.id,
+        &[("choice", choice.as_arg_value())],
+    );
 
     if verbose {
         eprintln!(
@@ -117,7 +127,7 @@ async fn run_post_login_validation_inner(
     } else {
         populate_generic_auth_test_report(
             provider,
-            choice.clone(),
+            choice,
             None,
             true,
             true,
@@ -132,6 +142,16 @@ async fn run_post_login_validation_inner(
     };
 
     persist_auth_test_report(&report);
+    let step_count = report.steps.len().to_string();
+    crate::logging::auth_event(
+        "post_login_validation_completed",
+        provider.id,
+        &[
+            ("choice", choice.as_arg_value()),
+            ("success", if report.success { "true" } else { "false" }),
+            ("steps", step_count.as_str()),
+        ],
+    );
     if verbose {
         print_auth_test_reports(std::slice::from_ref(&report));
     }
@@ -276,9 +296,7 @@ pub(crate) fn configured_auth_test_targets(
 ) -> Vec<ResolvedAuthTestTarget> {
     crate::provider_catalog::auth_status_login_providers()
         .into_iter()
-        .filter(|provider| {
-            status.state_for_provider(*provider) != crate::auth::AuthState::NotConfigured
-        })
+        .filter(|provider| status.assessment_for_provider(*provider).is_configured())
         .filter_map(ResolvedAuthTestTarget::from_provider)
         .collect()
 }

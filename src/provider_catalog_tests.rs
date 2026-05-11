@@ -91,10 +91,34 @@ fn auth_issue_profile_metadata_matches_direct_provider_endpoints() {
     assert_eq!(DEEPSEEK_PROFILE.api_base, "https://api.deepseek.com");
     assert_eq!(DEEPSEEK_PROFILE.default_model, Some("deepseek-v4-flash"));
     assert_eq!(DEEPSEEK_PROFILE.setup_url, "https://api-docs.deepseek.com/");
+    assert_eq!(MINIMAX_PROFILE.api_base, "https://api.minimax.io/v1");
+    assert_eq!(MINIMAX_PROFILE.api_key_env, "OPENAI_API_KEY");
+    assert_eq!(
+        ALIBABA_CODING_PLAN_PROFILE.api_base,
+        "https://coding-intl.dashscope.aliyuncs.com/v1"
+    );
     assert_eq!(COMTEGRA_PROFILE.api_base, "https://llm.comtegra.cloud/v1");
     assert_eq!(COMTEGRA_PROFILE.default_model, Some("glm-51-nvfp4"));
     assert_eq!(COMTEGRA_PROFILE.api_key_env, "COMTEGRA_API_KEY");
+    assert_eq!(CEREBRAS_PROFILE.api_base, "https://api.cerebras.ai/v1");
+    assert_eq!(
+        CEREBRAS_PROFILE.default_model,
+        Some("qwen-3-235b-a22b-instruct-2507")
+    );
     assert!(!OPENAI_COMPAT_PROFILE.setup_url.contains("opencode.ai"));
+}
+
+#[test]
+fn auth_issue_lan_openai_compatible_bases_are_valid_for_local_model_servers() {
+    assert_eq!(
+        normalize_api_base("http://100.103.78.84:11434/v1").as_deref(),
+        Some("http://100.103.78.84:11434/v1")
+    );
+    assert_eq!(
+        normalize_api_base("http://hsv.local:11434/v1").as_deref(),
+        Some("http://hsv.local:11434/v1")
+    );
+    assert_eq!(normalize_api_base("http://example.com/v1"), None);
 }
 
 #[test]
@@ -107,15 +131,108 @@ fn auth_issue_runtime_display_name_tracks_direct_compatible_profiles() {
         "JCODE_OPENROUTER_CACHE_NAMESPACE",
         "JCODE_OPENROUTER_PROVIDER_FEATURES",
         "JCODE_OPENROUTER_ALLOW_NO_AUTH",
+        "JCODE_RUNTIME_PROVIDER",
         "JCODE_NAMED_PROVIDER_PROFILE",
         "JCODE_PROVIDER_PROFILE_ACTIVE",
     ]);
+
+    crate::env::set_var("JCODE_RUNTIME_PROVIDER", "azure-openai");
+    assert_eq!(runtime_provider_display_name("openrouter"), "Azure OpenAI");
+    crate::env::remove_var("JCODE_RUNTIME_PROVIDER");
 
     apply_openai_compatible_profile_env(Some(DEEPSEEK_PROFILE));
     assert_eq!(runtime_provider_display_name("openrouter"), "DeepSeek");
 
     apply_openai_compatible_profile_env(Some(ZAI_PROFILE));
     assert_eq!(runtime_provider_display_name("openrouter"), "Z.AI");
+}
+
+#[test]
+fn auth_profile_env_application_flushes_stale_openrouter_catalog_state() {
+    let _lock = crate::storage::lock_test_env();
+    let _guard = EnvGuard::save(&[
+        "JCODE_OPENROUTER_API_BASE",
+        "JCODE_OPENROUTER_API_KEY_NAME",
+        "JCODE_OPENROUTER_ENV_FILE",
+        "JCODE_OPENROUTER_CACHE_NAMESPACE",
+        "JCODE_OPENROUTER_PROVIDER_FEATURES",
+        "JCODE_OPENROUTER_ALLOW_NO_AUTH",
+        "JCODE_OPENROUTER_MODEL_CATALOG",
+        "JCODE_OPENROUTER_MODEL",
+        "JCODE_OPENROUTER_STATIC_MODELS",
+        "JCODE_OPENROUTER_AUTH_HEADER",
+        "JCODE_OPENROUTER_AUTH_HEADER_NAME",
+        "JCODE_OPENROUTER_DYNAMIC_BEARER_PROVIDER",
+        "JCODE_OPENROUTER_PROVIDER",
+        "JCODE_OPENROUTER_NO_FALLBACK",
+        "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_PROVIDER_PROFILE_ACTIVE",
+        "JCODE_PROVIDER_PROFILE_NAME",
+    ]);
+
+    crate::env::set_var("JCODE_OPENROUTER_API_BASE", "https://openrouter.ai/api/v1");
+    crate::env::set_var("JCODE_OPENROUTER_API_KEY_NAME", "OPENROUTER_API_KEY");
+    crate::env::set_var("JCODE_OPENROUTER_ENV_FILE", "openrouter.env");
+    crate::env::set_var("JCODE_OPENROUTER_CACHE_NAMESPACE", "openrouter");
+    crate::env::set_var("JCODE_OPENROUTER_PROVIDER_FEATURES", "1");
+    crate::env::set_var("JCODE_OPENROUTER_ALLOW_NO_AUTH", "1");
+    crate::env::set_var(
+        "JCODE_OPENROUTER_MODEL_CATALOG",
+        "stale-openrouter-catalog.json",
+    );
+    crate::env::set_var("JCODE_OPENROUTER_MODEL", "gpt-5.5");
+    crate::env::set_var(
+        "JCODE_OPENROUTER_STATIC_MODELS",
+        "stale-openrouter-only-model",
+    );
+    crate::env::set_var("JCODE_OPENROUTER_AUTH_HEADER", "Bearer stale");
+    crate::env::set_var("JCODE_OPENROUTER_AUTH_HEADER_NAME", "Authorization");
+    crate::env::set_var("JCODE_OPENROUTER_DYNAMIC_BEARER_PROVIDER", "openrouter");
+    crate::env::set_var("JCODE_OPENROUTER_PROVIDER", "openrouter");
+    crate::env::set_var("JCODE_OPENROUTER_NO_FALLBACK", "1");
+    crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", "openrouter");
+    crate::env::set_var("JCODE_PROVIDER_PROFILE_ACTIVE", "1");
+    crate::env::set_var("JCODE_PROVIDER_PROFILE_NAME", "openrouter");
+
+    force_apply_openai_compatible_profile_env(Some(CEREBRAS_PROFILE));
+
+    assert_eq!(
+        std::env::var("JCODE_OPENROUTER_API_BASE").as_deref(),
+        Ok("https://api.cerebras.ai/v1")
+    );
+    assert_eq!(
+        std::env::var("JCODE_OPENROUTER_API_KEY_NAME").as_deref(),
+        Ok("CEREBRAS_API_KEY")
+    );
+    assert_eq!(
+        std::env::var("JCODE_OPENROUTER_ENV_FILE").as_deref(),
+        Ok("cerebras.env")
+    );
+    assert_eq!(
+        std::env::var("JCODE_OPENROUTER_CACHE_NAMESPACE").as_deref(),
+        Ok("cerebras")
+    );
+    assert_eq!(
+        std::env::var("JCODE_OPENROUTER_PROVIDER_FEATURES").as_deref(),
+        Ok("0")
+    );
+    assert!(std::env::var_os("JCODE_OPENROUTER_ALLOW_NO_AUTH").is_none());
+    assert!(std::env::var_os("JCODE_OPENROUTER_MODEL_CATALOG").is_none());
+    assert!(std::env::var_os("JCODE_OPENROUTER_MODEL").is_none());
+    assert!(std::env::var_os("JCODE_OPENROUTER_AUTH_HEADER").is_none());
+    assert!(std::env::var_os("JCODE_OPENROUTER_AUTH_HEADER_NAME").is_none());
+    assert!(std::env::var_os("JCODE_OPENROUTER_DYNAMIC_BEARER_PROVIDER").is_none());
+    assert!(std::env::var_os("JCODE_OPENROUTER_PROVIDER").is_none());
+    assert!(std::env::var_os("JCODE_OPENROUTER_NO_FALLBACK").is_none());
+    assert!(std::env::var_os("JCODE_NAMED_PROVIDER_PROFILE").is_none());
+    assert!(std::env::var_os("JCODE_PROVIDER_PROFILE_ACTIVE").is_none());
+    assert!(std::env::var_os("JCODE_PROVIDER_PROFILE_NAME").is_none());
+    assert_ne!(
+        std::env::var("JCODE_OPENROUTER_STATIC_MODELS")
+            .ok()
+            .as_deref(),
+        Some("stale-openrouter-only-model")
+    );
 }
 
 #[test]
