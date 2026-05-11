@@ -474,6 +474,10 @@ pub(super) fn build_persistent_header(app: &dyn TuiState, width: u16) -> Vec<Lin
         Line::from(Span::styled(version_text, Style::default().fg(dim_color()))).alignment(align),
     );
 
+    lines.push(
+        Line::from(Span::styled("jcode-42", Style::default().fg(dim_color()))).alignment(align),
+    );
+
     if let Some(dir) = app.working_dir() {
         let display_dir = abbreviate_home(&dir);
         lines.push(

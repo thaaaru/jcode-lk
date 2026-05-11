@@ -423,6 +423,7 @@ impl App {
             column: 0,
             filter: String::new(),
             preview: false,
+            free_filter_active: false,
         });
         self.input.clear();
         self.cursor_pos = 0;

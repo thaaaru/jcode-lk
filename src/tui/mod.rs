@@ -737,6 +737,8 @@ pub struct InlineInteractiveState {
     pub filter: String,
     /// Preview mode: picker is visible but input stays in main text box
     pub preview: bool,
+    /// Model picker-only: show routes that are free or included quota.
+    pub free_filter_active: bool,
 }
 
 impl InlineInteractiveState {
@@ -1000,6 +1002,12 @@ impl PickerEntry {
             _ => None,
         }
     }
+
+    pub fn active_route_is_free(&self) -> bool {
+        self.active_option()
+            .map(|option| option.is_free_route_for_model(&self.name))
+            .unwrap_or(false)
+    }
 }
 
 /// A single available option for a picker entry.
@@ -1010,6 +1018,24 @@ pub struct PickerOption {
     pub available: bool,
     pub detail: String,
     pub estimated_reference_cost_micros: Option<u64>,
+}
+
+impl PickerOption {
+    pub fn is_free_route_for_model(&self, model_name: &str) -> bool {
+        if self.estimated_reference_cost_micros == Some(0) {
+            return true;
+        }
+
+        let provider = self.provider.to_ascii_lowercase();
+        let api_method = self.api_method.to_ascii_lowercase();
+        let model = model_name.to_ascii_lowercase();
+
+        provider.contains("ollama")
+            || provider.contains("lmstudio")
+            || api_method.contains("ollama")
+            || api_method.contains("lmstudio")
+            || (api_method == "openrouter" && model.contains(":free"))
+    }
 }
 
 pub(crate) const REDRAW_IDLE: Duration = Duration::from_millis(250);

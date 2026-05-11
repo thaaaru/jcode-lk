@@ -100,6 +100,21 @@ fn picker_entry_display_name(entry: &crate::tui::PickerEntry) -> String {
     format!("{}{}", entry.name, suffix)
 }
 
+fn picker_model_display_name(
+    picker: &crate::tui::InlineInteractiveState,
+    entry: &crate::tui::PickerEntry,
+) -> String {
+    let display_name = picker_entry_display_name(entry);
+    if picker.kind == crate::tui::PickerKind::Model
+        && matches!(entry.action, crate::tui::PickerAction::Model)
+        && entry.active_route_is_free()
+    {
+        format!("● {}", display_name)
+    } else {
+        display_name
+    }
+}
+
 fn picker_row_marker(is_row_selected: bool, unavailable: bool, limited: bool) -> &'static str {
     if unavailable {
         "×"
@@ -239,7 +254,9 @@ fn picker_render_width(picker: &crate::tui::InlineInteractiveState, max_width: u
 
     for &fi in picker.filtered.iter().take(WIDTH_SCAN_LIMIT) {
         let entry = &picker.entries[fi];
-        max_model_len = max_model_len.max(display_width(picker_entry_display_name(entry).as_str()));
+        max_model_len = max_model_len.max(display_width(
+            picker_model_display_name(picker, entry).as_str(),
+        ));
         if let Some(route) = entry.active_option() {
             let provider_label = route_provider_display(&route.provider, &route.api_method);
             let provider_label = if entry.option_count() > 1 {
@@ -475,6 +492,9 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
     }
 
     let mut meta_parts = String::new();
+    if picker.kind == crate::tui::PickerKind::Model && picker.free_filter_active {
+        meta_parts.push_str("  free-only");
+    }
     if !picker.filter.is_empty() {
         meta_parts.push_str(&format!("  \"{}\"", picker.filter));
     }
@@ -500,6 +520,12 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
             header_spans.push(Span::styled(
                 "  ^D=default",
                 Style::default().fg(rgb(60, 60, 80)).italic(),
+            ));
+        }
+        if picker.kind == crate::tui::PickerKind::Model && !picker.uses_compact_navigation() {
+            header_spans.push(Span::styled(
+                "  F=free",
+                Style::default().fg(rgb(60, 90, 70)).italic(),
             ));
         }
     }
@@ -580,7 +606,7 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
                 Style::default().fg(dim_color())
             },
         ));
-        let display_name = picker_entry_display_name(entry);
+        let display_name = picker_model_display_name(picker, entry);
         let account_action_color = match &entry.action {
             crate::tui::PickerAction::Account(crate::tui::AccountPickerAction::Add { .. }) => {
                 Some(rgb(140, 220, 170))
@@ -601,6 +627,11 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
             Style::default().fg(color).bold()
         } else if entry.is_current {
             Style::default().fg(accent_color())
+        } else if picker.kind == crate::tui::PickerKind::Model
+            && matches!(entry.action, crate::tui::PickerAction::Model)
+            && entry.active_route_is_free()
+        {
+            Style::default().fg(rgb(140, 220, 170)).bold()
         } else if entry.recommended {
             Style::default().fg(rgb(255, 220, 120))
         } else if entry.old {
@@ -700,9 +731,13 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
                 } else {
                     0
                 };
-                raw.into_iter().map(|p| p + pad).collect()
+                raw.into_iter()
+                    .map(|p| p + pad + usize::from(display_name.starts_with("● ")) * 2)
+                    .collect()
             } else {
-                raw
+                raw.into_iter()
+                    .map(|p| p + usize::from(display_name.starts_with("● ")) * 2)
+                    .collect()
             }
         } else {
             Vec::new()
@@ -810,6 +845,7 @@ mod tests {
             column: 0,
             filter: String::new(),
             preview: false,
+            free_filter_active: false,
             entries: vec![crate::tui::PickerEntry {
                 name: "gpt-5.4".to_string(),
                 options: vec![crate::tui::PickerOption {
@@ -890,6 +926,7 @@ mod tests {
             column: 0,
             filter: String::new(),
             preview: false,
+            free_filter_active: false,
             entries: models,
         }
     }
@@ -902,6 +939,7 @@ mod tests {
             column: 0,
             filter: String::new(),
             preview: false,
+            free_filter_active: false,
             entries: vec![crate::tui::PickerEntry {
                 name: "Swarm / subagent".to_string(),
                 options: vec![crate::tui::PickerOption {

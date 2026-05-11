@@ -100,6 +100,7 @@ impl App {
             column: 0,
             filter: String::new(),
             preview: false,
+            free_filter_active: false,
         });
         self.input.clear();
         self.cursor_pos = 0;
@@ -368,6 +369,7 @@ impl App {
             column: 0,
             filter: String::new(),
             preview: false,
+            free_filter_active: false,
         });
         self.set_status_notice("Updating model list…");
     }
@@ -849,6 +851,7 @@ impl App {
                     picker.filter.clone(),
                     picker.selected,
                     picker.column,
+                    picker.free_filter_active,
                 ))
             } else {
                 None
@@ -880,13 +883,15 @@ impl App {
             column: 0,
             filter: String::new(),
             preview: false,
+            free_filter_active: false,
         });
 
-        if let Some((preview, filter, selected, column)) = previous_picker
+        if let Some((preview, filter, selected, column, free_filter_active)) = previous_picker
             && let Some(ref mut picker) = self.inline_interactive_state
         {
             picker.preview = preview;
             picker.filter = filter;
+            picker.free_filter_active = free_filter_active;
             picker.selected = selected.min(picker.filtered.len().saturating_sub(1));
             picker.column = column.min(picker.max_navigable_column());
             Self::apply_inline_interactive_filter(picker);
@@ -2012,6 +2017,29 @@ impl App {
                     Self::apply_inline_interactive_filter(picker);
                 }
             }
+            KeyCode::Char('F') if !modifiers.contains(KeyModifiers::CONTROL) => {
+                let mut notice = None;
+                if let Some(ref mut picker) = self.inline_interactive_state
+                    && picker.kind == PickerKind::Model
+                    && !picker.uses_compact_navigation()
+                    && picker
+                        .entries
+                        .iter()
+                        .any(|entry| matches!(entry.action, PickerAction::Model))
+                {
+                    picker.free_filter_active = !picker.free_filter_active;
+                    picker.selected = 0;
+                    Self::apply_inline_interactive_filter(picker);
+                    notice = Some(if picker.free_filter_active {
+                        "Model picker: free models only"
+                    } else {
+                        "Model picker: all models"
+                    });
+                }
+                if let Some(notice) = notice {
+                    self.set_status_notice(notice);
+                }
+            }
             KeyCode::Char(c) => {
                 if let Some(ref mut picker) = self.inline_interactive_state
                     && !c.is_whitespace()
@@ -2073,14 +2101,28 @@ impl App {
     }
 
     pub(super) fn apply_inline_interactive_filter(picker: &mut InlineInteractiveState) {
+        let free_filter_active = picker.kind == PickerKind::Model && picker.free_filter_active;
+        let entry_visible = |entry: &PickerEntry| {
+            !free_filter_active
+                || (matches!(entry.action, PickerAction::Model) && entry.active_route_is_free())
+        };
+
         if picker.filter.is_empty() {
-            picker.filtered = (0..picker.entries.len()).collect();
+            picker.filtered = picker
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, entry)| entry_visible(entry).then_some(i))
+                .collect();
         } else {
             let mut scored: Vec<(usize, i32)> = picker
                 .entries
                 .iter()
                 .enumerate()
                 .filter_map(|(i, m)| {
+                    if !entry_visible(m) {
+                        return None;
+                    }
                     let filter_text = picker.filter_text(m);
                     Self::picker_fuzzy_score(&picker.filter, &filter_text).map(|s| {
                         let bonus = if m.recommended { 5 } else { 0 };
